@@ -1,0 +1,16 @@
+# Update Script Configuration for Gitopia v6.0.0-rc.6
+
+# Server Configuration
+GIT_REPOS_DIR = "/var/repos"
+ATTACHMENT_DIR = "/var/attachments"
+WORKING_DIR = "/tmp/update-script"
+
+# Gitopia Network Configuration (v6.0.0-rc.6)
+GITOPIA_ADDR = "gitopia-grpc.polkachu.com:11390"
+TM_ADDR = "https://gitopia-rpc.polkachu.com:443"
+CHAIN_ID = "gitopia"
+GAS_PRICES = "0.001ulore"
+
+# IPFS Configuration
+IPFS_HOST = "127.0.0.1"
+IPFS_PORT = "5001"
