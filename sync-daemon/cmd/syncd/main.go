@@ -2,17 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/buger/jsonparser"
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/keys"
 	"github.com/cosmos/cosmos-sdk/client/tx"
@@ -20,7 +14,6 @@ import (
 	"github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
 	"github.com/gitopia/gitopia-migration-tools/sync-daemon/handler"
-	gitopiatypes "github.com/gitopia/gitopia/v5/x/gitopia/types"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/ipfs/kubo/client/rpc"
 	"github.com/pkg/errors"
@@ -141,86 +134,115 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
 	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient)
 
-	// Create WebSocket clients for event subscriptions
-	client1, err := gitopia.NewWSEvents(ctx)
+	// Create separate WebSocket clients for each query (older gitopia-go doesn't support multiple queries)
+	branchClient, err := gitopia.NewWSEvents(ctx, MsgMultiSetBranchQuery)
 	if err != nil {
-		return errors.Wrap(err, "failed to create WebSocket client 1")
-	}
-	defer client1.Close()
-
-	client1Queries := []string{
-		MsgMultiSetBranchQuery,
-		MsgMultiSetTagQuery,
+		return errors.WithMessage(err, "branch client error")
 	}
 
-	if err := client1.SubscribeQueries(ctx, client1Queries...); err != nil {
-		return errors.Wrap(err, "failed to subscribe to client 1 events")
-	}
-
-	client1EventHandlers := map[string]func(context.Context, []byte) error{
-		MsgMultiSetBranchQuery: branchHandler.Handle,
-		MsgMultiSetTagQuery:    tagHandler.Handle,
-	}
-
-	// Client 2: Release events
-	client2, err := gitopia.NewWSEvents(ctx)
+	tagClient, err := gitopia.NewWSEvents(ctx, MsgMultiSetTagQuery)
 	if err != nil {
-		return errors.Wrap(err, "failed to create WebSocket client 2")
-	}
-	defer client2.Close()
-
-	client2Queries := []string{
-		CreateReleaseQuery,
-		UpdateReleaseQuery,
-		DeleteReleaseQuery,
-		DaoCreateReleaseQuery,
+		return errors.WithMessage(err, "tag client error")
 	}
 
-	if err := client2.SubscribeQueries(ctx, client2Queries...); err != nil {
-		return errors.Wrap(err, "failed to subscribe to client 2 events")
+	createReleaseClient, err := gitopia.NewWSEvents(ctx, CreateReleaseQuery)
+	if err != nil {
+		return errors.WithMessage(err, "create release client error")
 	}
 
-	client2EventHandlers := map[string]func(context.Context, []byte) error{
-		CreateReleaseQuery: func(ctx context.Context, eventBuf []byte) error {
-			return releaseHandler.Handle(ctx, eventBuf, "CreateRelease")
-		},
-		UpdateReleaseQuery: func(ctx context.Context, eventBuf []byte) error {
-			return releaseHandler.Handle(ctx, eventBuf, "UpdateRelease")
-		},
-		DeleteReleaseQuery: func(ctx context.Context, eventBuf []byte) error {
-			return releaseHandler.Handle(ctx, eventBuf, "DeleteRelease")
-		},
-		DaoCreateReleaseQuery: func(ctx context.Context, eventBuf []byte) error {
-			return releaseHandler.Handle(ctx, eventBuf, "DaoCreateRelease")
-		},
+	updateReleaseClient, err := gitopia.NewWSEvents(ctx, UpdateReleaseQuery)
+	if err != nil {
+		return errors.WithMessage(err, "update release client error")
+	}
+
+	deleteReleaseClient, err := gitopia.NewWSEvents(ctx, DeleteReleaseQuery)
+	if err != nil {
+		return errors.WithMessage(err, "delete release client error")
+	}
+
+	daoCreateReleaseClient, err := gitopia.NewWSEvents(ctx, DaoCreateReleaseQuery)
+	if err != nil {
+		return errors.WithMessage(err, "dao create release client error")
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	// Start client 1 event processor
+	// Subscribe to branch events
 	g.Go(func() error {
-		done, errChan := client1.ProcessEvents(gCtx, func(ctx context.Context, eventBuf []byte) error {
-			return routeEventToHandler(ctx, eventBuf, client1EventHandlers)
-		})
+		done, errChan := branchClient.Subscribe(gCtx, branchHandler.Handle)
 		select {
 		case err := <-errChan:
-			return errors.Wrap(err, "client 1 event processing error")
+			return errors.WithMessage(err, "branch subscribe error")
 		case <-done:
-			logger.FromContext(ctx).Info("client 1 event processing completed")
+			logger.FromContext(ctx).Info("branch done")
 			return nil
 		}
 	})
 
-	// Start client 2 event processor
+	// Subscribe to tag events
 	g.Go(func() error {
-		done, errChan := client2.ProcessEvents(gCtx, func(ctx context.Context, eventBuf []byte) error {
-			return routeEventToHandler(ctx, eventBuf, client2EventHandlers)
+		done, errChan := tagClient.Subscribe(gCtx, tagHandler.Handle)
+		select {
+		case err := <-errChan:
+			return errors.WithMessage(err, "tag subscribe error")
+		case <-done:
+			logger.FromContext(ctx).Info("tag done")
+			return nil
+		}
+	})
+
+	// Subscribe to create release events
+	g.Go(func() error {
+		done, errChan := createReleaseClient.Subscribe(gCtx, func(ctx context.Context, eventBuf []byte) error {
+			return releaseHandler.Handle(ctx, eventBuf, "CreateRelease")
 		})
 		select {
 		case err := <-errChan:
-			return errors.Wrap(err, "client 2 event processing error")
+			return errors.WithMessage(err, "create release subscribe error")
 		case <-done:
-			logger.FromContext(ctx).Info("client 2 event processing completed")
+			logger.FromContext(ctx).Info("create release done")
+			return nil
+		}
+	})
+
+	// Subscribe to update release events
+	g.Go(func() error {
+		done, errChan := updateReleaseClient.Subscribe(gCtx, func(ctx context.Context, eventBuf []byte) error {
+			return releaseHandler.Handle(ctx, eventBuf, "UpdateRelease")
+		})
+		select {
+		case err := <-errChan:
+			return errors.WithMessage(err, "update release subscribe error")
+		case <-done:
+			logger.FromContext(ctx).Info("update release done")
+			return nil
+		}
+	})
+
+	// Subscribe to delete release events
+	g.Go(func() error {
+		done, errChan := deleteReleaseClient.Subscribe(gCtx, func(ctx context.Context, eventBuf []byte) error {
+			return releaseHandler.Handle(ctx, eventBuf, "DeleteRelease")
+		})
+		select {
+		case err := <-errChan:
+			return errors.WithMessage(err, "delete release subscribe error")
+		case <-done:
+			logger.FromContext(ctx).Info("delete release done")
+			return nil
+		}
+	})
+
+	// Subscribe to DAO create release events
+	g.Go(func() error {
+		done, errChan := daoCreateReleaseClient.Subscribe(gCtx, func(ctx context.Context, eventBuf []byte) error {
+			return releaseHandler.Handle(ctx, eventBuf, "DaoCreateRelease")
+		})
+		select {
+		case err := <-errChan:
+			return errors.WithMessage(err, "dao create release subscribe error")
+		case <-done:
+			logger.FromContext(ctx).Info("dao create release done")
 			return nil
 		}
 	})
@@ -228,22 +250,3 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 	return g.Wait()
 }
 
-// routeEventToHandler routes events to the appropriate handler based on the query field in the event.
-func routeEventToHandler(ctx context.Context, eventBuf []byte, handlers map[string]func(context.Context, []byte) error) error {
-	// Extract the query from the event buffer
-	query, err := jsonparser.GetString(eventBuf, "query")
-	if err != nil {
-		logger.FromContext(ctx).WithField("event", string(eventBuf)).WithError(err).Debug("failed to parse query from event, ignoring")
-		return nil
-	}
-
-	// Find the handler for this query
-	if handler, ok := handlers[query]; ok {
-		logger.FromContext(ctx).WithFields(logrus.Fields{"query": query}).Debug("routing event to handler")
-		return handler(ctx, eventBuf)
-	}
-
-	// If no handler matches, log and continue
-	logger.FromContext(ctx).WithField("query", query).Debug("no handler found for event query")
-	return nil
-}
