@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,7 +24,6 @@ type ReleaseEvent struct {
 	RepositoryId      uint64
 	RepositoryOwnerId string
 	Tag               string
-	Attachments       []gitopiatypes.Attachment
 }
 
 type ReleaseEventHandler struct {
@@ -89,16 +87,11 @@ func (h *ReleaseEventHandler) unmarshalReleaseEvent(eventBuf []byte, eventType s
 		return nil, errors.Wrap(err, "error parsing tag")
 	}
 
-	attachmentsArray, err := ExtractStringArray(eventBuf, "message", gitopiatypes.EventAttributeReleaseAttachmentsKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "error parsing attachments")
-	}
-
 	if len(creators) == 0 {
 		return events, nil
 	}
 
-	if !(len(repoIDs) == len(repoOwnerIDs) && len(repoIDs) == len(tags) && len(repoIDs) == len(attachmentsArray)) {
+	if !(len(repoIDs) == len(repoOwnerIDs) && len(repoIDs) == len(tags)) {
 		return nil, errors.New("mismatched attribute array lengths for ReleaseEvent")
 	}
 
@@ -108,19 +101,11 @@ func (h *ReleaseEventHandler) unmarshalReleaseEvent(eventBuf []byte, eventType s
 			return nil, errors.Wrap(err, "error parsing repository id")
 		}
 
-		var attachments []gitopiatypes.Attachment
-		attachmentsStr := attachmentsArray[i]
-		err = json.Unmarshal([]byte(attachmentsStr), &attachments)
-		if err != nil {
-			return nil, errors.Wrap(err, "error unmarshalling attachments")
-		}
-
 		events = append(events, ReleaseEvent{
 			Creator:           creators[i],
 			RepositoryId:      repoId,
 			RepositoryOwnerId: repoOwnerIDs[i],
 			Tag:               tags[i],
-			Attachments:       attachments,
 		})
 	}
 
@@ -138,9 +123,27 @@ func (h *ReleaseEventHandler) processReleaseEvent(ctx context.Context, event Rel
 
 	switch eventType {
 	case "CreateRelease", "DaoCreateRelease", "UpdateRelease":
+		// Query repository
+		repository, err := h.gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+			Id: event.RepositoryId,
+		})
+		if err != nil {
+			return errors.Wrap(err, "error getting repository")
+		}
+
+		// Query release attachments
+		release, err := h.gitopiaClient.QueryClient().Gitopia.RepositoryRelease(ctx, &gitopiatypes.QueryGetRepositoryReleaseRequest{
+			Id:             repository.Repository.Owner.Id,
+			RepositoryName: repository.Repository.Name,
+			TagName:        event.Tag,
+		})
+		if err != nil {
+			return errors.Wrap(err, "error getting release attachments")
+		}
+
 		// Download and pin all attachments
-		for _, attachment := range event.Attachments {
-			if err := h.processAttachment(ctx, event, attachment, attachmentDir); err != nil {
+		for _, attachment := range release.Release.Attachments {
+			if err := h.processAttachment(ctx, event, *attachment, attachmentDir); err != nil {
 				logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
 					"attachment":    attachment.Name,
 					"repository_id": event.RepositoryId,
@@ -179,7 +182,7 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 		attachment.Name)
 
 	filePath := filepath.Join(attachmentDir, attachment.Sha)
-	
+
 	// Check if file already exists
 	if _, err := os.Stat(filePath); err == nil {
 		logger.FromContext(ctx).WithFields(logrus.Fields{
@@ -228,4 +231,3 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 
 	return nil
 }
-
