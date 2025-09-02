@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +20,6 @@ import (
 	"github.com/gitopia/gitopia-migration-tools/utils"
 	gitopiatypes "github.com/gitopia/gitopia/v5/x/gitopia/types"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
-	"github.com/ipfs/kubo/client/rpc"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -78,7 +76,6 @@ func saveProgress(progress *CloneProgress) error {
 	}
 	return os.WriteFile(ProgressFile, data, 0644)
 }
-
 
 func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string, ipfsClusterClient ipfsclusterclient.Client) error {
 	lfsObjectsDir := filepath.Join(repoDir, "lfs", "objects")
@@ -255,6 +252,39 @@ func main() {
 						return errors.Wrapf(err, "error cloning repository %d", repository.Id)
 					}
 
+					// Handle forked repository optimization
+					if repository.Fork {
+						fmt.Printf("Repository %d is a fork of %d, setting up alternates\n", repository.Id, repository.Parent)
+
+						// Ensure parent repository is cloned first
+						parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
+						if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+							fmt.Printf("Parent repository %d not found, will be processed later\n", repository.Parent)
+						} else {
+							// Create alternates file to link with parent repo
+							alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+							if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+								progress.FailedRepos[repository.Id] = err.Error()
+								progress.LastFailedRepo = repository.Id
+								if err := saveProgress(progress); err != nil {
+									return errors.Wrap(err, "failed to save progress")
+								}
+								return errors.Wrapf(err, "error creating alternates directory for repo %d", repository.Id)
+							}
+
+							parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+							if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+								progress.FailedRepos[repository.Id] = err.Error()
+								progress.LastFailedRepo = repository.Id
+								if err := saveProgress(progress); err != nil {
+									return errors.Wrap(err, "failed to save progress")
+								}
+								return errors.Wrapf(err, "error creating alternates file for repo %d", repository.Id)
+							}
+							fmt.Printf("Created alternates file linking to parent repository %d\n", repository.Parent)
+						}
+					}
+
 					// Run git gc
 					cmd = exec.Command("git", "gc")
 					cmd.Dir = repoDir
@@ -267,7 +297,20 @@ func main() {
 						return errors.Wrapf(err, "error running git gc for repo %d", repository.Id)
 					}
 
-					// Pin packfile to IPFS cluster
+					// For forked repos with alternates, run git repack to remove common objects
+					if repository.Fork {
+						alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+						if _, err := os.Stat(alternatesPath); err == nil {
+							fmt.Printf("Running git repack to optimize forked repository %d\n", repository.Id)
+							cmd = exec.Command("git", "repack", "-a", "-d", "-l")
+							cmd.Dir = repoDir
+							if err := cmd.Run(); err != nil {
+								fmt.Printf("Warning: git repack failed for forked repo %d: %v\n", repository.Id, err)
+							}
+						}
+					}
+
+					// Pin packfile to IPFS cluster (skip for forked repos with no new objects)
 					packDir := filepath.Join(repoDir, "objects", "pack")
 					packFiles, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
 					if err != nil {
@@ -279,6 +322,7 @@ func main() {
 						return errors.Wrapf(err, "error finding packfiles for repo %d", repository.Id)
 					}
 
+					// Only pin packfiles for non-forked repos or forked repos with new objects
 					if len(packFiles) > 0 {
 						packfileName := packFiles[0] // Use the first packfile
 						_, err := utils.PinFileSimple(ipfsClusterClient, packfileName)
@@ -291,6 +335,8 @@ func main() {
 							return errors.Wrapf(err, "error pinning packfile for repo %d", repository.Id)
 						}
 						fmt.Printf("Successfully pinned packfile for repository %d\n", repository.Id)
+					} else if repository.Fork {
+						fmt.Printf("Forked repository %d has no packfile (no new changes), using parent objects via alternates\n", repository.Id)
 					}
 
 					// Process LFS objects
