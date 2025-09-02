@@ -72,16 +72,42 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 	// Check if repository directory exists, if not clone it
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("repository not found locally, cloning")
-		
+
 		remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Repository.Owner.Id, repository.Repository.Name)
 		cmd := exec.Command("git", "clone", "--bare", remoteUrl, repoDir)
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error cloning repository %d", repositoryID)
 		}
+
+		// Handle forked repository optimization
+		if repository.Repository.Fork {
+			logger.FromContext(ctx).WithFields(logrus.Fields{
+				"repository_id": repositoryID,
+				"parent_id":     repository.Repository.Parent,
+			}).Info("setting up alternates for forked repository")
+
+			// Ensure parent repository exists
+			parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Repository.Parent))
+			if _, err := os.Stat(parentRepoDir); err == nil {
+				// Create alternates file to link with parent repo
+				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+				if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+					return errors.Wrapf(err, "error creating alternates directory for repo %d", repositoryID)
+				}
+
+				parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+				if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+					return errors.Wrapf(err, "error creating alternates file for repo %d", repositoryID)
+				}
+				logger.FromContext(ctx).WithField("parent_id", repository.Repository.Parent).Info("created alternates file linking to parent repository")
+			} else {
+				logger.FromContext(ctx).WithField("parent_id", repository.Repository.Parent).Warn("parent repository not found, alternates not created")
+			}
+		}
 	} else {
 		// Update existing repository
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("updating existing repository tags")
-		
+
 		cmd := exec.Command("git", "fetch", "--tags", "--force")
 		cmd.Dir = repoDir
 		if err := cmd.Run(); err != nil {
@@ -96,28 +122,43 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 		return errors.Wrapf(err, "error running git gc for repo %d", repositoryID)
 	}
 
-	// Pin new packfiles to IPFS cluster
+	// For forked repos with alternates, run git repack to remove common objects
+	if repository.Repository.Fork {
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if _, err := os.Stat(alternatesPath); err == nil {
+			logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("running git repack to optimize forked repository")
+			cmd = exec.Command("git", "repack", "-a", "-d", "-l")
+			cmd.Dir = repoDir
+			if err := cmd.Run(); err != nil {
+				logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Warn("git repack failed for forked repo")
+			}
+		}
+	}
+
+	// Pin new packfiles to IPFS cluster (skip for forked repos)
 	packDir := filepath.Join(repoDir, "objects", "pack")
 	packFiles, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
 	if err != nil {
 		return errors.Wrapf(err, "error finding packfiles for repo %d", repositoryID)
 	}
 
-	for _, packfileName := range packFiles {
-		cid, err := utils.PinFileSimple(h.ipfsClusterClient, packfileName)
+	if len(packFiles) > 0 {
+
+		cid, err := utils.PinFileSimple(h.ipfsClusterClient, packFiles[0])
 		if err != nil {
-			logger.FromContext(ctx).WithError(err).WithField("packfile", packfileName).Error("failed to pin packfile")
-			continue
+			logger.FromContext(ctx).WithError(err).WithField("packfile", packFiles[0]).Error("failed to pin packfile")
 		}
-		
+
 		logger.FromContext(ctx).WithFields(logrus.Fields{
 			"repository_id": repositoryID,
-			"packfile":      filepath.Base(packfileName),
+			"packfile":      filepath.Base(packFiles[0]),
 			"cid":           cid,
 		}).Info("pinned updated packfile")
+
+	} else if repository.Repository.Fork {
+		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("forked repository has no packfile, using parent objects via alternates")
 	}
 
 	logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully processed repository tag update")
 	return nil
 }
-
