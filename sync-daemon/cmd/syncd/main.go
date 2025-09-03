@@ -29,12 +29,13 @@ const (
 	AppName              = "sync-daemon"
 
 	// Event queries for subscription
-	MsgMultiSetBranchQuery    = "tm.event='Tx' AND message.action='MsgMultiSetBranch'"
-	MsgMultiSetTagQuery       = "tm.event='Tx' AND message.action='MsgMultiSetTag'"
-	CreateReleaseQuery        = "tm.event='Tx' AND message.action='CreateRelease'"
-	UpdateReleaseQuery        = "tm.event='Tx' AND message.action='UpdateRelease'"
-	DeleteReleaseQuery        = "tm.event='Tx' AND message.action='DeleteRelease'"
-	DaoCreateReleaseQuery     = "tm.event='Tx' AND message.action='DaoCreateRelease'"
+	MsgMultiSetBranchQuery   = "tm.event='Tx' AND message.action='MsgMultiSetBranch'"
+	MsgMultiSetTagQuery      = "tm.event='Tx' AND message.action='MsgMultiSetTag'"
+	CreateReleaseQuery       = "tm.event='Tx' AND message.action='CreateRelease'"
+	UpdateReleaseQuery       = "tm.event='Tx' AND message.action='UpdateRelease'"
+	DeleteReleaseQuery       = "tm.event='Tx' AND message.action='DeleteRelease'"
+	DaoCreateReleaseQuery    = "tm.event='Tx' AND message.action='DaoCreateRelease'"
+	SetPullRequestStateQuery = "tm.event='Tx' AND message.action='SetPullRequestState'"
 )
 
 func main() {
@@ -133,6 +134,7 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 	branchHandler := handler.NewBranchEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
 	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
 	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient)
+	pullRequestHandler := handler.NewPullRequestEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
 
 	// Create separate WebSocket clients for each query (older gitopia-go doesn't support multiple queries)
 	branchClient, err := gitopia.NewWSEvents(ctx, MsgMultiSetBranchQuery)
@@ -163,6 +165,11 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 	daoCreateReleaseClient, err := gitopia.NewWSEvents(ctx, DaoCreateReleaseQuery)
 	if err != nil {
 		return errors.WithMessage(err, "dao create release client error")
+	}
+
+	setPullRequestStateClient, err := gitopia.NewWSEvents(ctx, SetPullRequestStateQuery)
+	if err != nil {
+		return errors.WithMessage(err, "set pull request state client error")
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -247,6 +254,17 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 		}
 	})
 
+	// Subscribe to set pull request state events
+	g.Go(func() error {
+		done, errChan := setPullRequestStateClient.Subscribe(gCtx, pullRequestHandler.Handle)
+		select {
+		case err := <-errChan:
+			return errors.WithMessage(err, "set pull request state subscribe error")
+		case <-done:
+			logger.FromContext(ctx).Info("set pull request state done")
+			return nil
+		}
+	})
+
 	return g.Wait()
 }
-
