@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,6 +157,13 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		}
 	}()
 	
+	// Check if repository packfile already exists in database (might be processed by sync daemon)
+	existingPackfile := storageManager.GetPackfileInfo(repoID)
+	if existingPackfile != nil && existingPackfile.UpdatedBy == "sync" {
+		fmt.Printf("Repository %d already processed by sync daemon, skipping\n", repoID)
+		return nil
+	}
+	
 	// Check if repository is empty
 	branch, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
 		Id:             repository.Owner.Id,
@@ -180,7 +189,16 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	// Handle forked repository optimization
 	if repository.Fork {
 		fmt.Printf("Repository %d is a fork of %d, setting up alternates\n", repoID, repository.Parent)
+		
+		// Ensure parent repository is processed first
 		parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
+		if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+			// Load parent repository if it doesn't exist
+			if err := loadParentRepository(ctx, repository.Parent, gitDir, ipfsClusterClient, storageManager, gitopiaClient); err != nil {
+				return errors.Wrapf(err, "error loading parent repository %d for fork %d", repository.Parent, repoID)
+			}
+		}
+		
 		if _, err := os.Stat(parentRepoDir); err == nil {
 			alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
 			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
@@ -244,13 +262,160 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		}
 		storageManager.SetPackfileInfo(packfileInfo)
 		fmt.Printf("Successfully pinned packfile for repository %d (CID: %s)\n", repoID, cid)
+		
+		// Delete the repository directory after successful pinning and storage
+		if err := os.RemoveAll(repoDir); err != nil {
+			fmt.Printf("Warning: failed to delete repository directory %s: %v\n", repoDir, err)
+		} else {
+			fmt.Printf("Successfully deleted repository directory for repo %d\n", repoID)
+		}
 	} else if repository.Fork {
 		fmt.Printf("Forked repository %d has no packfile (no new changes), using parent objects via alternates\n", repoID)
+		
+		// Delete the repository directory after processing fork
+		if err := os.RemoveAll(repoDir); err != nil {
+			fmt.Printf("Warning: failed to delete forked repository directory %s: %v\n", repoDir, err)
+		} else {
+			fmt.Printf("Successfully deleted forked repository directory for repo %d\n", repoID)
+		}
 	}
 
 	// Process LFS objects
 	if err := processLFSObjects(ctx, repoID, repoDir, ipfsClusterClient, storageManager); err != nil {
 		return errors.Wrapf(err, "error processing LFS objects for repo %d", repoID)
+	}
+
+	return nil
+}
+
+// loadParentRepository loads a parent repository for forked repos
+func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, gitopiaClient *gc.Client) error {
+	// Check if parent packfile exists in storage manager
+	parentPackfile := storageManager.GetPackfileInfo(parentRepoID)
+	if parentPackfile == nil {
+		return errors.Errorf("parent repository %d packfile not found in storage", parentRepoID)
+	}
+
+	// Get parent repository info
+	parentRepository, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+		Id: parentRepoID,
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to get parent repository")
+	}
+
+	// Check if parent repository is empty
+	branch, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+		Id:             parentRepository.Repository.Owner.Id,
+		RepositoryName: parentRepository.Repository.Name,
+		BranchName:     parentRepository.Repository.DefaultBranch,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "error getting parent repository branches for repo %d", parentRepoID)
+	}
+	if branch.Branch.Name == "" {
+		fmt.Printf("Parent repository %d is empty, skipping\n", parentRepoID)
+		return nil
+	}
+
+	// Initialize parent repository directory
+	parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", parentRepoID))
+	if _, err := os.Stat(filepath.Join(parentRepoDir, "objects")); os.IsNotExist(err) {
+		cmd := exec.Command("git", "init", "--bare", parentRepoDir)
+		if err := cmd.Run(); err != nil {
+			return errors.Wrapf(err, "failed to initialize parent repository %d", parentRepoID)
+		}
+	}
+
+	// Download packfile from IPFS cluster using CID from storage
+	if err := downloadPackfileFromIPFS(parentPackfile.CID, parentPackfile.Name, parentRepoDir); err != nil {
+		return errors.Wrapf(err, "error downloading parent packfile for repo %d", parentRepoID)
+	}
+
+	// Recursively load parent's parent if it's also a fork
+	if parentRepository.Repository.Fork {
+		grandParentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", parentRepository.Repository.Parent))
+		if _, err := os.Stat(grandParentRepoDir); os.IsNotExist(err) {
+			if err := loadParentRepository(ctx, parentRepository.Repository.Parent, gitDir, ipfsClusterClient, storageManager, gitopiaClient); err != nil {
+				return errors.Wrapf(err, "error loading grandparent repository %d", parentRepository.Repository.Parent)
+			}
+		}
+		
+		// Set up alternates for parent repository
+		if _, err := os.Stat(grandParentRepoDir); err == nil {
+			alternatesPath := filepath.Join(parentRepoDir, "objects", "info", "alternates")
+			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+				return errors.Wrapf(err, "error creating alternates directory for parent repo %d", parentRepoID)
+			}
+			grandParentObjectsPath := filepath.Join(grandParentRepoDir, "objects")
+			if err := os.WriteFile(alternatesPath, []byte(grandParentObjectsPath+"\n"), 0644); err != nil {
+				return errors.Wrapf(err, "error creating alternates file for parent repo %d", parentRepoID)
+			}
+			fmt.Printf("Created alternates file linking parent repository %d to grandparent %d\n", parentRepoID, parentRepository.Repository.Parent)
+		}
+	}
+
+	// Run git gc on parent repository
+	cmd := exec.Command("git", "gc")
+	cmd.Dir = parentRepoDir
+	if err := cmd.Run(); err != nil {
+		return errors.Wrapf(err, "error running git gc for parent repo %d", parentRepoID)
+	}
+
+	// Parent packfile is already stored in IPFS cluster, no need to pin again
+	fmt.Printf("Successfully loaded parent repository %d from IPFS (CID: %s)\n", parentRepoID, parentPackfile.CID)
+
+	return nil
+}
+
+// downloadPackfileFromIPFS downloads a packfile from IPFS cluster and sets up the repository
+func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
+	// Download packfile from IPFS cluster
+	packDir := filepath.Join(repoDir, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0755); err != nil {
+		return errors.Wrap(err, "failed to create pack directory")
+	}
+
+	packfilePath := filepath.Join(packDir, packfileName)
+	if err := downloadFromIPFSCluster(cid, packfilePath); err != nil {
+		return errors.Wrap(err, "failed to download packfile from IPFS")
+	}
+
+	// Build pack index file
+	cmd := exec.Command("git", "index-pack", packfilePath)
+	cmd.Dir = repoDir
+	if err := cmd.Run(); err != nil {
+		return errors.Wrap(err, "failed to build pack index")
+	}
+
+	return nil
+}
+
+// downloadFromIPFSCluster downloads a file from IPFS cluster using HTTP API
+func downloadFromIPFSCluster(cid, filePath string) error {
+	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false", 
+		viper.GetString("IPFS_CLUSTER_PEER_HOST"), 
+		viper.GetString("IPFS_CLUSTER_PEER_PORT"), 
+		cid)
+	
+	resp, err := http.Post(ipfsUrl, "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("failed to fetch file from IPFS: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to fetch file from IPFS: %v", resp.Status)
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %v", err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		return fmt.Errorf("failed to write file: %v", err)
 	}
 
 	return nil
@@ -330,6 +495,13 @@ func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string,
 		storageManager.SetLFSObjectInfo(lfsInfo)
 
 		fmt.Printf("Successfully pinned LFS object %s (CID: %s)\n", oid, cid)
+		
+		// Delete the LFS object file after successful pinning
+		if err := os.Remove(oidPath); err != nil {
+			fmt.Printf("Warning: failed to delete LFS object file %s: %v\n", oidPath, err)
+		} else {
+			fmt.Printf("Successfully deleted LFS object file %s\n", oidPath)
+		}
 	}
 
 	return nil
@@ -533,6 +705,13 @@ func main() {
 					}
 
 					for _, attachment := range release.Attachments {
+						// Check if release asset already exists in database (might be processed by sync daemon)
+						existingAsset := storageManager.GetReleaseAssetInfo(release.RepositoryId, release.TagName, attachment.Name)
+						if existingAsset != nil && existingAsset.UpdatedBy == "sync" {
+							fmt.Printf("Release asset %s for repository %d tag %s already processed by sync daemon, skipping\n", attachment.Name, release.RepositoryId, release.TagName)
+							continue
+						}
+						
 						// Download release asset
 						attachmentUrl := fmt.Sprintf("%s/releases/%s/%s/%s/%s",
 							viper.GetString("GIT_SERVER_HOST"),
@@ -612,6 +791,13 @@ func main() {
 						storageManager.SetReleaseAssetInfo(assetInfo)
 
 						fmt.Printf("Successfully downloaded and pinned attachment %s for release %s (CID: %s)\n", attachment.Name, release.TagName, cid)
+						
+						// Delete the attachment file after successful pinning
+						if err := os.Remove(filePath); err != nil {
+							fmt.Printf("Warning: failed to delete attachment file %s: %v\n", filePath, err)
+						} else {
+							fmt.Printf("Successfully deleted attachment file %s\n", filePath)
+						}
 					}
 
 					// Mark release as successfully processed

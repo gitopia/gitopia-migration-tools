@@ -230,6 +230,9 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 	if err != nil {
 		logger.FromContext(ctx).WithError(err).WithField("attachment", attachment.Name).Error("failed to compute file info for attachment")
 	} else {
+		// Get existing release asset info to unpin older version
+		existingAsset := h.storageManager.GetReleaseAssetInfo(event.RepositoryId, event.Tag, attachment.Name)
+		
 		// Store release asset information (sync daemon takes precedence)
 		assetInfo := &shared.ReleaseAssetInfo{
 			RepositoryID: event.RepositoryId,
@@ -245,6 +248,32 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 		h.storageManager.SetReleaseAssetInfo(assetInfo)
 		if err := h.storageManager.Save(); err != nil {
 			logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+		}
+		
+		// Unpin older version if it exists and is different
+		if existingAsset != nil && existingAsset.CID != cid {
+			if err := shared.UnpinFile(h.ipfsClusterClient, existingAsset.CID); err != nil {
+				logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+					"repository_id": event.RepositoryId,
+					"tag":           event.Tag,
+					"attachment":    attachment.Name,
+					"old_cid":       existingAsset.CID,
+				}).Warn("failed to unpin older release asset version")
+			} else {
+				logger.FromContext(ctx).WithFields(logrus.Fields{
+					"repository_id": event.RepositoryId,
+					"tag":           event.Tag,
+					"attachment":    attachment.Name,
+					"old_cid":       existingAsset.CID,
+				}).Info("successfully unpinned older release asset version")
+			}
+		}
+
+		// Delete the attachment file after successful pinning and storage
+		if err := os.Remove(filePath); err != nil {
+			logger.FromContext(ctx).WithError(err).WithField("file_path", filePath).Warn("failed to delete attachment file")
+		} else {
+			logger.FromContext(ctx).WithField("file_path", filePath).Info("successfully deleted attachment file")
 		}
 	}
 

@@ -89,8 +89,14 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 				"parent_id":     repository.Repository.Parent,
 			}).Info("setting up alternates for forked repository")
 
-			// Ensure parent repository exists
+			// Load parent repository if it doesn't exist
 			parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Repository.Parent))
+			if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+				if err := LoadParentRepository(ctx, repository.Repository.Parent, gitDir, h.gitopiaClient, h.ipfsClusterClient, h.storageManager); err != nil {
+					return errors.Wrapf(err, "error loading parent repository %d", repository.Repository.Parent)
+				}
+			}
+			
 			if _, err := os.Stat(parentRepoDir); err == nil {
 				// Create alternates file to link with parent repo
 				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
@@ -157,6 +163,9 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 		if err != nil {
 			logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to compute file info for packfile")
 		} else {
+			// Get existing packfile info to unpin older version
+			existingPackfile := h.storageManager.GetPackfileInfo(repositoryID)
+			
 			// Store packfile information (sync daemon takes precedence)
 			packfileInfo := &shared.PackfileInfo{
 				RepositoryID: repositoryID,
@@ -170,6 +179,27 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 			if err := h.storageManager.Save(); err != nil {
 				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 			}
+			
+			// Unpin older version if it exists and is different
+			if existingPackfile != nil && existingPackfile.CID != cid {
+				if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
+					logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"old_cid":       existingPackfile.CID,
+					}).Warn("failed to unpin older packfile version")
+				} else {
+					logger.FromContext(ctx).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"old_cid":       existingPackfile.CID,
+					}).Info("successfully unpinned older packfile version")
+				}
+			}
+			// Delete the repository directory after successful pinning and storage
+			if err := os.RemoveAll(repoDir); err != nil {
+				logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete repository directory")
+			} else {
+				logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted repository directory")
+			}
 		}
 
 		logger.FromContext(ctx).WithFields(logrus.Fields{
@@ -179,8 +209,15 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 
 	} else if repository.Repository.Fork {
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("forked repository has no packfile, using parent objects via alternates")
+		// Delete the repository directory after processing fork
+		if err := os.RemoveAll(repoDir); err != nil {
+			logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete forked repository directory")
+		} else {
+			logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted forked repository directory")
+		}
 	}
 
 	logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully processed repository tag update")
 	return nil
 }
+

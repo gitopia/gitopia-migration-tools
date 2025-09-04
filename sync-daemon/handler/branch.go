@@ -90,8 +90,14 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 				"parent_id":     repository.Repository.Parent,
 			}).Info("setting up alternates for forked repository")
 
-			// Ensure parent repository exists
+			// Load parent repository if it doesn't exist
 			parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Repository.Parent))
+			if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+				if err := LoadParentRepository(ctx, repository.Repository.Parent, gitDir, h.gitopiaClient, h.ipfsClusterClient, h.storageManager); err != nil {
+					return errors.Wrapf(err, "error loading parent repository %d", repository.Repository.Parent)
+				}
+			}
+			
 			if _, err := os.Stat(parentRepoDir); err == nil {
 				// Create alternates file to link with parent repo
 				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
@@ -157,7 +163,10 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 			if err != nil {
 				logger.FromContext(ctx).WithError(err).WithField("packfile", packFiles[0]).Error("failed to compute file info")
 			} else {
-				// Store packfile information (sync daemon takes precedence)
+				// Get existing packfile info to unpin older version
+				existingPackfile := h.storageManager.GetPackfileInfo(repositoryID)
+				
+				// Store new packfile information (sync daemon takes precedence)
 				packfileInfo := &shared.PackfileInfo{
 					RepositoryID: repositoryID,
 					Name:         filepath.Base(packFiles[0]),
@@ -171,6 +180,28 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 				if err := h.storageManager.Save(); err != nil {
 					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 				}
+				
+				// Unpin older version if it exists and is different
+				if existingPackfile != nil && existingPackfile.CID != cid {
+					if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
+						logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+						}).Warn("failed to unpin older packfile version")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+						}).Info("successfully unpinned older packfile version")
+					}
+				}
+				
+				// Delete the repository directory after successful pinning and storage
+				if err := os.RemoveAll(repoDir); err != nil {
+					logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete repository directory")
+				} else {
+					logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted repository directory")
+				}
 			}
 		}
 
@@ -181,6 +212,13 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 		}).Info("pinned updated packfile")
 	} else if repository.Repository.Fork {
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("forked repository has no packfile, using parent objects via alternates")
+		
+		// Delete the repository directory after processing fork
+		if err := os.RemoveAll(repoDir); err != nil {
+			logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete forked repository directory")
+		} else {
+			logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted forked repository directory")
+		}
 	}
 
 	// Process LFS objects if they exist
@@ -246,6 +284,9 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 		if err != nil {
 			logger.FromContext(ctx).WithError(err).WithField("oid", oid).Error("failed to compute file info for LFS object")
 		} else {
+			// Get existing LFS object info to unpin older version
+			existingLFS := h.storageManager.GetLFSObjectInfo(repositoryID, oid)
+			
 			// Store LFS object information (sync daemon takes precedence)
 			lfsInfo := &shared.LFSObjectInfo{
 				RepositoryID: repositoryID,
@@ -260,6 +301,30 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 			if err := h.storageManager.Save(); err != nil {
 				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 			}
+			
+			// Unpin older version if it exists and is different
+			if existingLFS != nil && existingLFS.CID != cid {
+				if err := shared.UnpinFile(h.ipfsClusterClient, existingLFS.CID); err != nil {
+					logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"oid":           oid,
+						"old_cid":       existingLFS.CID,
+					}).Warn("failed to unpin older LFS object version")
+				} else {
+					logger.FromContext(ctx).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"oid":           oid,
+						"old_cid":       existingLFS.CID,
+					}).Info("successfully unpinned older LFS object version")
+				}
+			}
+			
+			// Delete the LFS object file after successful pinning
+			if err := os.Remove(oidPath); err != nil {
+				logger.FromContext(ctx).WithError(err).WithField("oid_path", oidPath).Warn("failed to delete LFS object file")
+			} else {
+				logger.FromContext(ctx).WithField("oid_path", oidPath).Info("successfully deleted LFS object file")
+			}
 		}
 
 		logger.FromContext(ctx).WithFields(logrus.Fields{
@@ -271,3 +336,4 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 
 	return nil
 }
+

@@ -115,6 +115,31 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error cloning repository %d", repositoryID)
 		}
+		
+		// Handle forked repository optimization
+		if repository.Repository.Fork {
+			// Load parent repository if it doesn't exist
+			parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Repository.Parent))
+			if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+				if err := LoadParentRepository(ctx, repository.Repository.Parent, gitDir, h.gitopiaClient, h.ipfsClusterClient, h.storageManager); err != nil {
+					return errors.Wrapf(err, "error loading parent repository %d", repository.Repository.Parent)
+				}
+			}
+			
+			if _, err := os.Stat(parentRepoDir); err == nil {
+				// Create alternates file to link with parent repo
+				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+				if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+					return errors.Wrapf(err, "error creating alternates directory for repo %d", repositoryID)
+				}
+
+				parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+				if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+					return errors.Wrapf(err, "error creating alternates file for repo %d", repositoryID)
+				}
+				logger.FromContext(ctx).WithField("parent_id", repository.Repository.Parent).Info("created alternates file linking to parent repository")
+			}
+		}
 	} else {
 		// Update existing repository to get the latest merged changes
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("updating repository after merge")
@@ -164,6 +189,13 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 				if err := h.storageManager.Save(); err != nil {
 					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 				}
+				
+				// Delete the repository directory after successful pinning and storage
+				if err := os.RemoveAll(repoDir); err != nil {
+					logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete repository directory")
+				} else {
+					logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted repository directory")
+				}
 			}
 
 			logger.FromContext(ctx).WithFields(logrus.Fields{
@@ -172,8 +204,16 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 				"cid":           cid,
 			}).Info("pinned updated packfile after pull request merge")
 		}
+	} else if repository.Repository.Fork {
+		// Delete the repository directory after processing fork
+		if err := os.RemoveAll(repoDir); err != nil {
+			logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete forked repository directory")
+		} else {
+			logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully deleted forked repository directory")
+		}
 	}
 
 	logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully processed repository after pull request merge")
 	return nil
 }
+
