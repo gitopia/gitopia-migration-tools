@@ -231,6 +231,4 @@ require (
 // https://github.com/cosmos/cosmos-sdk/issues/20159
 replace golang.org/x/exp => golang.org/x/exp v0.0.0-20230711153332-06a737ee72cb
 
-replace github.com/gitopia/gitopia-migration-tools/utils => ../utils
-
-replace github.com/gitopia/gitopia-migration-tools/shared => ../shared
+replace github.com/multiformats/go-multiaddr => github.com/multiformats/go-multiaddr v0.10.1
