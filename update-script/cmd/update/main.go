@@ -70,7 +70,7 @@ func (btm *BatchTxManager) ProcessBatch(ctx context.Context) error {
 	fmt.Printf("Processing batch of %d transactions...\n", len(btm.txQueue))
 
 	// Send all messages in a single transaction
-	_, err := btm.client.BroadcastTx(ctx, btm.txQueue...)
+	err := btm.client.BroadcastTxAndWait(ctx, btm.txQueue...)
 	if err != nil {
 		return errors.Wrap(err, "failed to broadcast batch transaction")
 	}
@@ -151,7 +151,7 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 		}
 
 		msg := &storagetypes.MsgUpdateRepositoryPackfile{
-			Creator:      batchMgr.client.ClientAddress(),
+			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: packfileInfo.RepositoryID,
 			Name:         packfileInfo.Name,
 			Cid:          packfileInfo.CID,
@@ -176,7 +176,7 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 
 // processReleaseAssets processes release assets using stored data
 func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
-	allReleaseAssets := storageManager.GetAllReleaseAssetInfo()
+	allReleaseAssets := storageManager.GetAllReleaseAssets()
 
 	// Group assets by repository and tag
 	assetsByRelease := make(map[string][]*shared.ReleaseAssetInfo)
@@ -207,9 +207,9 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 		}
 
 		msg := &storagetypes.MsgUpdateReleaseAssets{
-			Creator:      batchMgr.client.ClientAddress(),
+			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: assets[0].RepositoryID,
-			TagName:      assets[0].TagName,
+			Tag:          assets[0].TagName,
 			Assets:       assetUpdates,
 		}
 
@@ -229,7 +229,7 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 
 // processLFSObjects processes LFS objects using stored data
 func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
-	allLFSObjects := storageManager.GetAllLFSObjectInfo()
+	allLFSObjects := storageManager.GetAllLFSObjects()
 
 	for _, lfsInfo := range allLFSObjects {
 		lfsKey := fmt.Sprintf("%d-%s", lfsInfo.RepositoryID, lfsInfo.OID)
@@ -238,7 +238,7 @@ func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageMan
 		}
 
 		msg := &storagetypes.MsgUpdateLFSObject{
-			Creator:      batchMgr.client.ClientAddress(),
+			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: lfsInfo.RepositoryID,
 			Oid:          lfsInfo.OID,
 			Cid:          lfsInfo.CID,
