@@ -13,6 +13,7 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
+	"github.com/gitopia/gitopia-migration-tools/shared"
 	"github.com/gitopia/gitopia-migration-tools/sync-daemon/handler"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/ipfs/kubo/client/rpc"
@@ -130,11 +131,17 @@ func startSyncDaemon(cmd *cobra.Command) error {
 func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi) error {
 	logger.FromContext(ctx).Info("starting event processor for sync daemon")
 
+	// Initialize storage manager
+	storageManager := shared.NewStorageManager(viper.GetString("WORKING_DIR"))
+	if err := storageManager.Load(); err != nil {
+		return errors.Wrap(err, "failed to load storage manager")
+	}
+
 	// Initialize handlers
-	branchHandler := handler.NewBranchEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
-	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
-	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient)
-	pullRequestHandler := handler.NewPullRequestEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi)
+	branchHandler := handler.NewBranchEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
+	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
+	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient, storageManager)
+	pullRequestHandler := handler.NewPullRequestEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
 
 	// Create separate WebSocket clients for each query (older gitopia-go doesn't support multiple queries)
 	branchClient, err := gitopia.NewWSEvents(ctx, MsgMultiSetBranchQuery)

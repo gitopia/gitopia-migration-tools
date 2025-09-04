@@ -4,8 +4,8 @@ go 1.21
 
 require (
 	github.com/cosmos/cosmos-sdk v0.47.13
-	github.com/gitopia/gitopia-go v0.7.0-rc.3
-	github.com/gitopia/gitopia/v6 v6.0.0-rc.6
+	github.com/gitopia/gitopia-go v0.7.0
+	github.com/gitopia/gitopia/v6 v6.0.0
 	github.com/ipfs-cluster/ipfs-cluster v1.0.8
 	github.com/ipfs/boxo v0.17.0
 	github.com/ipfs/kubo v0.25.0

@@ -8,10 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
-	"github.com/gitopia/gitopia-migration-tools/utils"
+	"github.com/gitopia/gitopia-migration-tools/shared"
 	gitopiatypes "github.com/gitopia/gitopia/v5/x/gitopia/types"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/pkg/errors"
@@ -29,12 +30,14 @@ type ReleaseEvent struct {
 type ReleaseEventHandler struct {
 	gitopiaClient     gc.Client
 	ipfsClusterClient ipfsclusterclient.Client
+	storageManager    *shared.StorageManager
 }
 
-func NewReleaseEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client) *ReleaseEventHandler {
+func NewReleaseEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager) *ReleaseEventHandler {
 	return &ReleaseEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
+		storageManager:    storageManager,
 	}
 }
 
@@ -217,9 +220,32 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 	}
 
 	// Pin to IPFS cluster
-	cid, err := utils.PinFileSimple(h.ipfsClusterClient, filePath)
+	cid, err := shared.PinFile(h.ipfsClusterClient, filePath)
 	if err != nil {
 		return errors.Wrap(err, "error pinning attachment")
+	}
+
+	// Compute merkle root and file info
+	rootHash, size, err := shared.ComputeFileInfo(filePath, cid)
+	if err != nil {
+		logger.FromContext(ctx).WithError(err).WithField("attachment", attachment.Name).Error("failed to compute file info for attachment")
+	} else {
+		// Store release asset information (sync daemon takes precedence)
+		assetInfo := &shared.ReleaseAssetInfo{
+			RepositoryID: event.RepositoryId,
+			TagName:      event.Tag,
+			Name:         attachment.Name,
+			CID:          cid,
+			RootHash:     rootHash,
+			Size:         size,
+			SHA256:       attachment.Sha,
+			UpdatedAt:    time.Now(),
+			UpdatedBy:    "sync",
+		}
+		h.storageManager.SetReleaseAssetInfo(assetInfo)
+		if err := h.storageManager.Save(); err != nil {
+			logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+		}
 	}
 
 	logger.FromContext(ctx).WithFields(logrus.Fields{

@@ -8,10 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
-	"github.com/gitopia/gitopia-migration-tools/utils"
+	"github.com/gitopia/gitopia-migration-tools/shared"
 	gitopiatypes "github.com/gitopia/gitopia/v5/x/gitopia/types"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/ipfs/kubo/client/rpc"
@@ -24,13 +25,15 @@ type BranchEventHandler struct {
 	gitopiaClient     gc.Client
 	ipfsClusterClient ipfsclusterclient.Client
 	ipfsHttpApi       *rpc.HttpApi
+	storageManager    *shared.StorageManager
 }
 
-func NewBranchEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi) *BranchEventHandler {
+func NewBranchEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager) *BranchEventHandler {
 	return &BranchEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		ipfsHttpApi:       ipfsHttpApi,
+		storageManager:    storageManager,
 	}
 }
 
@@ -144,9 +147,31 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 	}
 
 	if len(packFiles) > 0 {
-		cid, err := utils.PinFileSimple(h.ipfsClusterClient, packFiles[0])
+		packfilePath := packFiles[0]
+		cid, err := shared.PinFile(h.ipfsClusterClient, packfilePath)
 		if err != nil {
 			logger.FromContext(ctx).WithError(err).WithField("packfile", packFiles[0]).Error("failed to pin packfile")
+		} else {
+			// Compute merkle root and file info
+			rootHash, size, err := shared.ComputeFileInfo(packFiles[0], cid)
+			if err != nil {
+				logger.FromContext(ctx).WithError(err).WithField("packfile", packFiles[0]).Error("failed to compute file info")
+			} else {
+				// Store packfile information (sync daemon takes precedence)
+				packfileInfo := &shared.PackfileInfo{
+					RepositoryID: repositoryID,
+					Name:         filepath.Base(packFiles[0]),
+					CID:          cid,
+					RootHash:     rootHash,
+					Size:         size,
+					UpdatedAt:    time.Now(),
+					UpdatedBy:    "sync",
+				}
+				h.storageManager.SetPackfileInfo(packfileInfo)
+				if err := h.storageManager.Save(); err != nil {
+					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+				}
+			}
 		}
 
 		logger.FromContext(ctx).WithFields(logrus.Fields{
@@ -207,13 +232,34 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 	for _, oid := range lfsObjects {
 		oidPath := filepath.Join(lfsObjectsDir, oid[:2], oid[2:])
 
-		cid, err := utils.PinFileSimple(h.ipfsClusterClient, oidPath)
+		cid, err := shared.PinFile(h.ipfsClusterClient, oidPath)
 		if err != nil {
 			logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
 				"repository_id": repositoryID,
 				"oid":           oid,
 			}).Error("failed to pin LFS object")
 			continue
+		}
+
+		// Compute merkle root and file info
+		rootHash, size, err := shared.ComputeFileInfo(oidPath, cid)
+		if err != nil {
+			logger.FromContext(ctx).WithError(err).WithField("oid", oid).Error("failed to compute file info for LFS object")
+		} else {
+			// Store LFS object information (sync daemon takes precedence)
+			lfsInfo := &shared.LFSObjectInfo{
+				RepositoryID: repositoryID,
+				OID:          oid,
+				CID:          cid,
+				RootHash:     rootHash,
+				Size:         size,
+				UpdatedAt:    time.Now(),
+				UpdatedBy:    "sync",
+			}
+			h.storageManager.SetLFSObjectInfo(lfsInfo)
+			if err := h.storageManager.Save(); err != nil {
+				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+			}
 		}
 
 		logger.FromContext(ctx).WithFields(logrus.Fields{

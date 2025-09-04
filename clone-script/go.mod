@@ -5,6 +5,7 @@ go 1.21
 require (
 	github.com/cosmos/cosmos-sdk v0.47.13
 	github.com/gitopia/gitopia-go v0.6.2
+	github.com/gitopia/gitopia-migration-tools/shared v0.0.0-00010101000000-000000000000
 	github.com/gitopia/gitopia-migration-tools/utils v0.0.0-00010101000000-000000000000
 	github.com/gitopia/gitopia/v5 v5.1.0
 	github.com/ipfs-cluster/ipfs-cluster v1.0.8
@@ -246,3 +247,5 @@ require (
 replace golang.org/x/exp => golang.org/x/exp v0.0.0-20230711153332-06a737ee72cb
 
 replace github.com/gitopia/gitopia-migration-tools/utils => ../utils
+
+replace github.com/gitopia/gitopia-migration-tools/shared => ../shared

@@ -1,16 +1,14 @@
-package utils
+package shared
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 )
 
-// PinFile pins a file to IPFS cluster using the same approach as gitopia-storage
 func PinFile(ipfsClusterClient ipfsclusterclient.Client, filePath string) (string, error) {
 	paths := []string{filePath}
 	addParams := api.DefaultAddParams()
@@ -47,31 +45,13 @@ func PinFile(ipfsClusterClient ipfsclusterclient.Client, filePath string) (strin
 	return cid.String(), nil
 }
 
-// PinFileSimple provides a simpler pinning method similar to the existing implementations
-func PinFileSimple(ipfsClusterClient ipfsclusterclient.Client, filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
-
-	// Add file to IPFS cluster
-	resp, err := ipfsClusterClient.Add(context.Background(), file, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to add file to IPFS cluster: %w", err)
-	}
-
-	return resp.Cid.String(), nil
-}
-
-// UnpinFile unpins a file from IPFS cluster
 func UnpinFile(ipfsClusterClient ipfsclusterclient.Client, cidString string) error {
 	cid, err := api.DecodeCid(cidString)
 	if err != nil {
 		return err
 	}
 
-	// unpin the file from IPFS cluster
+	// unpin the packfile from IPFS cluster
 	_, err = ipfsClusterClient.Unpin(context.Background(), cid)
 	if err != nil {
 		return err

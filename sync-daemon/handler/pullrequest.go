@@ -7,10 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
-	"github.com/gitopia/gitopia-migration-tools/utils"
+	"github.com/gitopia/gitopia-migration-tools/shared"
 	gitopiatypes "github.com/gitopia/gitopia/v5/x/gitopia/types"
 	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/ipfs/kubo/client/rpc"
@@ -23,13 +24,15 @@ type PullRequestEventHandler struct {
 	gitopiaClient     gc.Client
 	ipfsClusterClient ipfsclusterclient.Client
 	ipfsHttpApi       *rpc.HttpApi
+	storageManager    *shared.StorageManager
 }
 
-func NewPullRequestEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi) *PullRequestEventHandler {
+func NewPullRequestEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager) *PullRequestEventHandler {
 	return &PullRequestEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		ipfsHttpApi:       ipfsHttpApi,
+		storageManager:    storageManager,
 	}
 }
 
@@ -138,13 +141,34 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 	}
 
 	if len(packFiles) > 0 {
-		cid, err := utils.PinFileSimple(h.ipfsClusterClient, packFiles[0])
+		packfilePath := packFiles[0]
+		cid, err := shared.PinFile(h.ipfsClusterClient, packfilePath)
 		if err != nil {
-			logger.FromContext(ctx).WithError(err).WithField("packfile", packFiles[0]).Error("failed to pin packfile after merge")
+			logger.FromContext(ctx).WithError(err).WithField("packfile", packfilePath).Error("failed to pin packfile after merge")
 		} else {
+			// Compute merkle root and file info
+			rootHash, size, err := shared.ComputeFileInfo(packfilePath, cid)
+			if err != nil {
+				logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to compute file info for packfile")
+			} else {
+				// Store packfile information (sync daemon takes precedence)
+				packfileInfo := &shared.PackfileInfo{
+					RepositoryID: repositoryID,
+					CID:          cid,
+					RootHash:     rootHash,
+					Size:         size,
+					UpdatedAt:    time.Now(),
+					UpdatedBy:    "sync",
+				}
+				h.storageManager.SetPackfileInfo(packfileInfo)
+				if err := h.storageManager.Save(); err != nil {
+					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+				}
+			}
+
 			logger.FromContext(ctx).WithFields(logrus.Fields{
 				"repository_id": repositoryID,
-				"packfile":      filepath.Base(packFiles[0]),
+				"packfile":      filepath.Base(packfilePath),
 				"cid":           cid,
 			}).Info("pinned updated packfile after pull request merge")
 		}
