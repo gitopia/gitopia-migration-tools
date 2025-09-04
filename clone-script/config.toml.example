@@ -3,7 +3,7 @@
 # Server Configuration
 GIT_REPOS_DIR = "/var/repos"
 ATTACHMENT_DIR = "/var/attachments"
-WORKING_DIR = "/tmp/clone-script"
+WORKING_DIR = "/var/gitopia-migration"
 
 # Gitopia Network Configuration (v5.1.0)
 GITOPIA_ADDR = "gitopia-grpc.polkachu.com:11390"
