@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,21 +35,19 @@ const (
 	ProgressFile         = "gitopia_clone_progress.json"
 )
 
-
-
 type CloneProgress struct {
-	RepositoryNextKey     []byte            `json:"repository_next_key"`
-	ReleaseNextKey        []byte            `json:"release_next_key"`
-	FailedRepos           map[uint64]string `json:"failed_repos"`
-	FailedReleases        map[uint64]string `json:"failed_releases"`
-	LastFailedRepo        uint64            `json:"last_failed_repo"`
-	LastFailedRelease     uint64            `json:"last_failed_release"`
-	LastProcessedRepoID   uint64            `json:"last_processed_repo_id"`
-	LastProcessedReleaseID uint64           `json:"last_processed_release_id"`
-	ProcessedRepos        map[uint64]bool   `json:"processed_repos"`
-	ProcessedReleases     map[uint64]bool   `json:"processed_releases"`
-	CurrentBatchRepos     []uint64          `json:"current_batch_repos"`
-	CurrentBatchReleases  []uint64          `json:"current_batch_releases"`
+	RepositoryNextKey      []byte            `json:"repository_next_key"`
+	ReleaseNextKey         []byte            `json:"release_next_key"`
+	FailedRepos            map[uint64]string `json:"failed_repos"`
+	FailedReleases         map[uint64]string `json:"failed_releases"`
+	LastFailedRepo         uint64            `json:"last_failed_repo"`
+	LastFailedRelease      uint64            `json:"last_failed_release"`
+	LastProcessedRepoID    uint64            `json:"last_processed_repo_id"`
+	LastProcessedReleaseID uint64            `json:"last_processed_release_id"`
+	ProcessedRepos         map[uint64]bool   `json:"processed_repos"`
+	ProcessedReleases      map[uint64]bool   `json:"processed_releases"`
+	CurrentBatchRepos      []uint64          `json:"current_batch_repos"`
+	CurrentBatchReleases   []uint64          `json:"current_batch_releases"`
 }
 
 func loadProgress() (*CloneProgress, error) {
@@ -103,12 +100,12 @@ func shouldProcessRepo(progress *CloneProgress, repoID uint64) bool {
 	if progress.ProcessedRepos[repoID] {
 		return false
 	}
-	
+
 	// Process if it's a failed repo (retry)
 	if _, isFailed := progress.FailedRepos[repoID]; isFailed {
 		return true
 	}
-	
+
 	// Process if it's a new repo (ID > last processed)
 	return repoID > progress.LastProcessedRepoID
 }
@@ -119,12 +116,12 @@ func shouldProcessRelease(progress *CloneProgress, releaseID uint64) bool {
 	if progress.ProcessedReleases[releaseID] {
 		return false
 	}
-	
+
 	// Process if it's a failed release (retry)
 	if _, isFailed := progress.FailedReleases[releaseID]; isFailed {
 		return true
 	}
-	
+
 	// Process if it's a new release (ID > last processed)
 	return releaseID > progress.LastProcessedReleaseID
 }
@@ -134,7 +131,7 @@ func validateForkDependency(progress *CloneProgress, repository *gitopiatypes.Re
 	if !repository.Fork {
 		return nil
 	}
-	
+
 	parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
 	if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
 		// Check if parent is in current batch or already processed
@@ -146,12 +143,12 @@ func validateForkDependency(progress *CloneProgress, repository *gitopiatypes.Re
 }
 
 // Atomic operation for repository processing
-func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repository, gitDir string, 
-	ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, 
+func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repository, gitDir string,
+	ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager,
 	gitopiaClient *gc.Client, progress *CloneProgress, pinataClient *shared.PinataClient) error {
-	
+
 	repoID := repository.Id
-	
+
 	defer func() {
 		// On any error, ensure we don't mark as processed
 		if r := recover(); r != nil {
@@ -160,14 +157,14 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 			panic(r)
 		}
 	}()
-	
+
 	// Check if repository packfile already exists in database (might be processed by sync daemon)
 	existingPackfile := storageManager.GetPackfileInfo(repoID)
 	if existingPackfile != nil && existingPackfile.UpdatedBy == "sync" {
 		fmt.Printf("Repository %d already processed by sync daemon, skipping\n", repoID)
 		return nil
 	}
-	
+
 	// Check if repository is empty
 	branch, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
 		Id:             repository.Owner.Id,
@@ -193,7 +190,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	// Handle forked repository optimization
 	if repository.Fork {
 		fmt.Printf("Repository %d is a fork of %d, setting up alternates\n", repoID, repository.Parent)
-		
+
 		// Ensure parent repository is processed first
 		parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
 		if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
@@ -202,7 +199,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 				return errors.Wrapf(err, "error loading parent repository %d for fork %d", repository.Parent, repoID)
 			}
 		}
-		
+
 		if _, err := os.Stat(parentRepoDir); err == nil {
 			alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
 			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
@@ -266,7 +263,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		}
 		storageManager.SetPackfileInfo(packfileInfo)
 		fmt.Printf("Successfully pinned packfile for repository %d (CID: %s)\n", repoID, cid)
-		
+
 		// Pin to Pinata if enabled
 		if pinataClient != nil {
 			resp, err := pinataClient.PinFile(ctx, packfileName, filepath.Base(packfileName))
@@ -276,7 +273,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 				fmt.Printf("Successfully pinned packfile to Pinata for repository %d (Pinata ID: %s)\n", repoID, resp.Data.ID)
 			}
 		}
-		
+
 		// Delete the repository directory after successful pinning and storage
 		if err := os.RemoveAll(repoDir); err != nil {
 			fmt.Printf("Warning: failed to delete repository directory %s: %v\n", repoDir, err)
@@ -285,7 +282,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		}
 	} else if repository.Fork {
 		fmt.Printf("Forked repository %d has no packfile (no new changes), using parent objects via alternates\n", repoID)
-		
+
 		// Delete the repository directory after processing fork
 		if err := os.RemoveAll(repoDir); err != nil {
 			fmt.Printf("Warning: failed to delete forked repository directory %s: %v\n", repoDir, err)
@@ -354,7 +351,7 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 				return errors.Wrapf(err, "error loading grandparent repository %d", parentRepository.Repository.Parent)
 			}
 		}
-		
+
 		// Set up alternates for parent repository
 		if _, err := os.Stat(grandParentRepoDir); err == nil {
 			alternatesPath := filepath.Join(parentRepoDir, "objects", "info", "alternates")
@@ -407,11 +404,11 @@ func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
 
 // downloadFromIPFSCluster downloads a file from IPFS cluster using HTTP API
 func downloadFromIPFSCluster(cid, filePath string) error {
-	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false", 
-		viper.GetString("IPFS_CLUSTER_PEER_HOST"), 
-		viper.GetString("IPFS_CLUSTER_PEER_PORT"), 
+	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false",
+		viper.GetString("IPFS_CLUSTER_PEER_HOST"),
+		viper.GetString("IPFS_CLUSTER_PEER_PORT"),
 		cid)
-	
+
 	resp, err := http.Post(ipfsUrl, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch file from IPFS: %v", err)
@@ -509,7 +506,7 @@ func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string,
 		storageManager.SetLFSObjectInfo(lfsInfo)
 
 		fmt.Printf("Successfully pinned LFS object %s (CID: %s)\n", oid, cid)
-		
+
 		// Pin to Pinata if enabled
 		if pinataClient != nil {
 			resp, err := pinataClient.PinFile(ctx, oidPath, oid)
@@ -519,7 +516,7 @@ func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string,
 				fmt.Printf("Successfully pinned LFS object to Pinata for repository %d, oid %s (Pinata ID: %s)\n", repositoryId, oid, resp.Data.ID)
 			}
 		}
-		
+
 		// Delete the LFS object file after successful pinning
 		if err := os.Remove(oidPath); err != nil {
 			fmt.Printf("Warning: failed to delete LFS object file %s: %v\n", oidPath, err)
@@ -745,7 +742,7 @@ func main() {
 							fmt.Printf("Release asset %s for repository %d tag %s already processed by sync daemon, skipping\n", attachment.Name, release.RepositoryId, release.TagName)
 							continue
 						}
-						
+
 						// Download release asset
 						attachmentUrl := fmt.Sprintf("%s/releases/%s/%s/%s/%s",
 							viper.GetString("GIT_SERVER_HOST"),
@@ -836,7 +833,7 @@ func main() {
 						storageManager.SetReleaseAssetInfo(assetInfo)
 
 						fmt.Printf("Successfully downloaded and pinned attachment %s for release %s (CID: %s)\n", attachment.Name, release.TagName, cid)
-						
+
 						// Delete the attachment file after successful pinning
 						if err := os.Remove(filePath); err != nil {
 							fmt.Printf("Warning: failed to delete attachment file %s: %v\n", filePath, err)

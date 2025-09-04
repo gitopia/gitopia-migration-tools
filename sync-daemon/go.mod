@@ -8,7 +8,7 @@ require (
 	github.com/buger/jsonparser v1.1.1
 	github.com/cosmos/cosmos-sdk v0.47.13
 	github.com/gitopia/gitopia-go v0.6.2
-	github.com/gitopia/gitopia-migration-tools/shared v0.0.1
+	github.com/gitopia/gitopia-migration-tools/shared v0.0.2
 	github.com/gitopia/gitopia/v5 v5.1.0
 	github.com/ipfs-cluster/ipfs-cluster v1.1.2
 	github.com/ipfs/kubo v0.25.0

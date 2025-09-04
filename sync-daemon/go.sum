@@ -253,8 +253,8 @@ github.com/getsentry/sentry-go v0.27.0/go.mod h1:lc76E2QywIyW8WuBnwl8Lc4bkmQH4+w
 github.com/ghodss/yaml v1.0.0/go.mod h1:4dBDuWmgqj2HViK6kFavaiC9ZROes6MMH2rRYeMEF04=
 github.com/gitopia/gitopia-go v0.6.2 h1:3Xu090ObJ8TP5FqmRj/blRSX0721ootXojwuOJLHb6Y=
 github.com/gitopia/gitopia-go v0.6.2/go.mod h1:UueURx6CKcAl95Y+ldqX1k41TlfjM8fRuBCUNanW6TY=
-github.com/gitopia/gitopia-migration-tools/shared v0.0.1 h1:vmSCqmuyijf3NLIuq6AyzW9z5H+QZKGfvV3RhXmwFKE=
-github.com/gitopia/gitopia-migration-tools/shared v0.0.1/go.mod h1:pIEdPO9sIPYh/9LoF/kgigTP5KXRObYoCnFYYm6sBrc=
+github.com/gitopia/gitopia-migration-tools/shared v0.0.2 h1:ZGdHf1BfFn/3lDkCBpoBLBE2nsN5PPXyk7EFDaBmGS4=
+github.com/gitopia/gitopia-migration-tools/shared v0.0.2/go.mod h1:pIEdPO9sIPYh/9LoF/kgigTP5KXRObYoCnFYYm6sBrc=
 github.com/gitopia/gitopia/v5 v5.1.0 h1:a/RySnjfpRYJwbkqW76QFmkBW/FihLDJHEpCtbF85Zg=
 github.com/gitopia/gitopia/v5 v5.1.0/go.mod h1:t1FjB6j0LlGB2Ka1+Hu+XiARQ4NHhoVx9uKiR8+yhwc=
 github.com/gliderlabs/ssh v0.1.1/go.mod h1:U7qILu1NlMHj9FlMhZLlkCdDnU1DBEAqr0aevW3Awn0=
