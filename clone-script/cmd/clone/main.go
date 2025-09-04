@@ -182,7 +182,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	// Clone repository
 	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
 	remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Owner.Id, repository.Name)
-	cmd := exec.Command("git", "clone", "--bare", remoteUrl, repoDir)
+	cmd := exec.Command("git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
 	if err := cmd.Run(); err != nil {
 		return errors.Wrapf(err, "error cloning repository %d", repoID)
 	}

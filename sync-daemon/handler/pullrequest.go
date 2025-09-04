@@ -113,11 +113,11 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("repository not found locally, cloning")
 
 		remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Repository.Owner.Id, repository.Repository.Name)
-		cmd := exec.Command("git", "clone", "--bare", remoteUrl, repoDir)
+		cmd := exec.Command("git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error cloning repository %d", repositoryID)
 		}
-		
+
 		// Handle forked repository optimization
 		if repository.Repository.Fork {
 			// Load parent repository if it doesn't exist
@@ -127,7 +127,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 					return errors.Wrapf(err, "error loading parent repository %d", repository.Repository.Parent)
 				}
 			}
-			
+
 			if _, err := os.Stat(parentRepoDir); err == nil {
 				// Create alternates file to link with parent repo
 				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
@@ -180,7 +180,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 			} else {
 				// Get existing packfile info to unpin older version
 				existingPackfile := h.storageManager.GetPackfileInfo(repositoryID)
-				
+
 				// Store packfile information (sync daemon takes precedence)
 				packfileInfo := &shared.PackfileInfo{
 					RepositoryID: repositoryID,
@@ -195,7 +195,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 				if err := h.storageManager.Save(); err != nil {
 					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 				}
-				
+
 				// Pin to Pinata if enabled
 				if h.pinataClient != nil {
 					resp, err := h.pinataClient.PinFile(ctx, packfilePath, filepath.Base(packfilePath))
@@ -209,7 +209,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 						}).Info("successfully pinned packfile to Pinata after merge")
 					}
 				}
-				
+
 				// Unpin older version if it exists and is different
 				if existingPackfile != nil && existingPackfile.CID != cid {
 					if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
@@ -223,7 +223,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 							"old_cid":       existingPackfile.CID,
 						}).Info("successfully unpinned older packfile version from IPFS cluster")
 					}
-					
+
 					// Unpin from Pinata if enabled
 					if h.pinataClient != nil && existingPackfile.Name != "" {
 						if err := h.pinataClient.UnpinFile(ctx, existingPackfile.Name); err != nil {
@@ -241,7 +241,7 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 						}
 					}
 				}
-				
+
 				// Delete the repository directory after successful pinning and storage
 				if err := os.RemoveAll(repoDir); err != nil {
 					logger.FromContext(ctx).WithError(err).WithField("repo_dir", repoDir).Warn("failed to delete repository directory")
@@ -268,4 +268,3 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 	logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully processed repository after pull request merge")
 	return nil
 }
-

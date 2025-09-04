@@ -79,7 +79,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 		logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("repository not found locally, cloning")
 
 		remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Repository.Owner.Id, repository.Repository.Name)
-		cmd := exec.Command("git", "clone", "--bare", remoteUrl, repoDir)
+		cmd := exec.Command("git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error cloning repository %d", repositoryID)
 		}
@@ -98,7 +98,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 					return errors.Wrapf(err, "error loading parent repository %d", repository.Repository.Parent)
 				}
 			}
-			
+
 			if _, err := os.Stat(parentRepoDir); err == nil {
 				// Create alternates file to link with parent repo
 				alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
@@ -167,7 +167,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 		} else {
 			// Get existing packfile info to unpin older version
 			existingPackfile := h.storageManager.GetPackfileInfo(repositoryID)
-			
+
 			// Store packfile information (sync daemon takes precedence)
 			packfileInfo := &shared.PackfileInfo{
 				RepositoryID: repositoryID,
@@ -181,7 +181,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 			if err := h.storageManager.Save(); err != nil {
 				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 			}
-			
+
 			// Pin to Pinata if enabled
 			if h.pinataClient != nil {
 				resp, err := h.pinataClient.PinFile(ctx, packfilePath, filepath.Base(packfilePath))
@@ -195,7 +195,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 					}).Info("successfully pinned packfile to Pinata")
 				}
 			}
-			
+
 			// Unpin older version if it exists and is different
 			if existingPackfile != nil && existingPackfile.CID != cid {
 				if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
@@ -209,7 +209,7 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 						"old_cid":       existingPackfile.CID,
 					}).Info("successfully unpinned older packfile version from IPFS cluster")
 				}
-				
+
 				// Unpin from Pinata if enabled
 				if h.pinataClient != nil && existingPackfile.Name != "" {
 					if err := h.pinataClient.UnpinFile(ctx, existingPackfile.Name); err != nil {
@@ -253,4 +253,3 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 	logger.FromContext(ctx).WithField("repository_id", repositoryID).Info("successfully processed repository tag update")
 	return nil
 }
-
