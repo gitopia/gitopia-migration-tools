@@ -26,14 +26,16 @@ type BranchEventHandler struct {
 	ipfsClusterClient ipfsclusterclient.Client
 	ipfsHttpApi       *rpc.HttpApi
 	storageManager    *shared.StorageManager
+	pinataClient      *shared.PinataClient
 }
 
-func NewBranchEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager) *BranchEventHandler {
+func NewBranchEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) *BranchEventHandler {
 	return &BranchEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		ipfsHttpApi:       ipfsHttpApi,
 		storageManager:    storageManager,
+		pinataClient:      pinataClient,
 	}
 }
 
@@ -181,6 +183,20 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
 				}
 				
+				// Pin to Pinata if enabled
+				if h.pinataClient != nil {
+					resp, err := h.pinataClient.PinFile(ctx, packFiles[0], filepath.Base(packFiles[0]))
+					if err != nil {
+						logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to pin packfile to Pinata")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"packfile":      filepath.Base(packFiles[0]),
+							"pinata_id":     resp.Data.ID,
+						}).Info("successfully pinned packfile to Pinata")
+					}
+				}
+				
 				// Unpin older version if it exists and is different
 				if existingPackfile != nil && existingPackfile.CID != cid {
 					if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
@@ -300,6 +316,23 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 			h.storageManager.SetLFSObjectInfo(lfsInfo)
 			if err := h.storageManager.Save(); err != nil {
 				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+			}
+			
+			// Pin to Pinata if enabled
+			if h.pinataClient != nil {
+				resp, err := h.pinataClient.PinFile(ctx, oidPath, oid)
+				if err != nil {
+					logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"oid":           oid,
+					}).Error("failed to pin LFS object to Pinata")
+				} else {
+					logger.FromContext(ctx).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"oid":           oid,
+						"pinata_id":     resp.Data.ID,
+					}).Info("successfully pinned LFS object to Pinata")
+				}
 			}
 			
 			// Unpin older version if it exists and is different

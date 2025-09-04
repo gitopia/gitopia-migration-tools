@@ -137,11 +137,21 @@ func startEventProcessor(ctx context.Context, gitopiaClient gitopia.Client, ipfs
 		return errors.Wrap(err, "failed to load storage manager")
 	}
 
+	// Initialize Pinata client if JWT token is provided
+	var pinataClient *shared.PinataClient
+	pinataJWT := viper.GetString("PINATA_JWT_TOKEN")
+	if pinataJWT != "" {
+		pinataClient = shared.NewPinataClient(pinataJWT)
+		logger.FromContext(ctx).Info("Pinata client initialized")
+	} else {
+		logger.FromContext(ctx).Info("Pinata JWT token not provided, skipping Pinata uploads")
+	}
+
 	// Initialize handlers
-	branchHandler := handler.NewBranchEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
-	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
-	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient, storageManager)
-	pullRequestHandler := handler.NewPullRequestEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager)
+	branchHandler := handler.NewBranchEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager, pinataClient)
+	tagHandler := handler.NewTagEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager, pinataClient)
+	releaseHandler := handler.NewReleaseEventHandler(gitopiaClient, ipfsClusterClient, storageManager, pinataClient)
+	pullRequestHandler := handler.NewPullRequestEventHandler(gitopiaClient, ipfsClusterClient, ipfsHttpApi, storageManager, pinataClient)
 
 	// Create separate WebSocket clients for each query (older gitopia-go doesn't support multiple queries)
 	branchClient, err := gitopia.NewWSEvents(ctx, MsgMultiSetBranchQuery)

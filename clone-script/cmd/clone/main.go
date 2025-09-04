@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,9 +32,11 @@ import (
 const (
 	AccountAddressPrefix = "gitopia"
 	AccountPubKeyPrefix  = AccountAddressPrefix + sdk.PrefixPublic
-	AppName              = "clone-script"
-	ProgressFile         = "clone_progress.json"
+	AppName              = "gitopia-clone-script"
+	ProgressFile         = "gitopia_clone_progress.json"
 )
+
+
 
 type CloneProgress struct {
 	RepositoryNextKey     []byte            `json:"repository_next_key"`
@@ -144,7 +148,7 @@ func validateForkDependency(progress *CloneProgress, repository *gitopiatypes.Re
 // Atomic operation for repository processing
 func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repository, gitDir string, 
 	ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, 
-	gitopiaClient *gc.Client, progress *CloneProgress) error {
+	gitopiaClient *gc.Client, progress *CloneProgress, pinataClient *shared.PinataClient) error {
 	
 	repoID := repository.Id
 	
@@ -263,6 +267,16 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		storageManager.SetPackfileInfo(packfileInfo)
 		fmt.Printf("Successfully pinned packfile for repository %d (CID: %s)\n", repoID, cid)
 		
+		// Pin to Pinata if enabled
+		if pinataClient != nil {
+			resp, err := pinataClient.PinFile(ctx, packfileName, filepath.Base(packfileName))
+			if err != nil {
+				fmt.Printf("Warning: failed to pin packfile to Pinata for repo %d: %v\n", repoID, err)
+			} else {
+				fmt.Printf("Successfully pinned packfile to Pinata for repository %d (Pinata ID: %s)\n", repoID, resp.Data.ID)
+			}
+		}
+		
 		// Delete the repository directory after successful pinning and storage
 		if err := os.RemoveAll(repoDir); err != nil {
 			fmt.Printf("Warning: failed to delete repository directory %s: %v\n", repoDir, err)
@@ -281,7 +295,7 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	}
 
 	// Process LFS objects
-	if err := processLFSObjects(ctx, repoID, repoDir, ipfsClusterClient, storageManager); err != nil {
+	if err := processLFSObjects(ctx, repoID, repoDir, ipfsClusterClient, storageManager, pinataClient); err != nil {
 		return errors.Wrapf(err, "error processing LFS objects for repo %d", repoID)
 	}
 
@@ -421,7 +435,7 @@ func downloadFromIPFSCluster(cid, filePath string) error {
 	return nil
 }
 
-func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager) error {
+func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) error {
 	lfsObjectsDir := filepath.Join(repoDir, "lfs", "objects")
 
 	if _, err := os.Stat(lfsObjectsDir); os.IsNotExist(err) {
@@ -496,6 +510,16 @@ func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string,
 
 		fmt.Printf("Successfully pinned LFS object %s (CID: %s)\n", oid, cid)
 		
+		// Pin to Pinata if enabled
+		if pinataClient != nil {
+			resp, err := pinataClient.PinFile(ctx, oidPath, oid)
+			if err != nil {
+				fmt.Printf("Warning: failed to pin LFS object to Pinata for repo %d, oid %s: %v\n", repositoryId, oid, err)
+			} else {
+				fmt.Printf("Successfully pinned LFS object to Pinata for repository %d, oid %s (Pinata ID: %s)\n", repositoryId, oid, resp.Data.ID)
+			}
+		}
+		
 		// Delete the LFS object file after successful pinning
 		if err := os.Remove(oidPath); err != nil {
 			fmt.Printf("Warning: failed to delete LFS object file %s: %v\n", oidPath, err)
@@ -564,6 +588,16 @@ func main() {
 				return errors.Wrap(err, "failed to create IPFS cluster client")
 			}
 
+			// Initialize Pinata client if JWT token is provided
+			var pinataClient *shared.PinataClient
+			pinataJWT := viper.GetString("PINATA_JWT_TOKEN")
+			if pinataJWT != "" {
+				pinataClient = shared.NewPinataClient(pinataJWT)
+				log.Println("Pinata client initialized")
+			} else {
+				log.Println("Pinata JWT token not provided, skipping Pinata uploads")
+			}
+
 			// Process repositories
 			var processedCount int
 			var totalRepositories uint64
@@ -611,7 +645,7 @@ func main() {
 					fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, totalRepositories)
 
 					// Use atomic processing function
-					if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress); err != nil {
+					if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
 						progress.FailedRepos[repository.Id] = err.Error()
 						progress.LastFailedRepo = repository.Id
 						if err := saveProgress(progress); err != nil {
@@ -763,6 +797,17 @@ func main() {
 								return errors.Wrap(err, "failed to save progress")
 							}
 							return errors.Wrap(err, "error pinning attachment")
+						}
+
+						// Pin to Pinata if enabled
+						if pinataClient != nil {
+							name := fmt.Sprintf("release-%d-%s-%s-%s", release.RepositoryId, release.TagName, attachment.Name, attachment.Sha)
+							resp, err := pinataClient.PinFile(ctx, filePath, name)
+							if err != nil {
+								fmt.Printf("Warning: failed to pin release asset to Pinata for repo %d, tag %s, asset %s: %v\n", release.RepositoryId, release.TagName, attachment.Name, err)
+							} else {
+								fmt.Printf("Successfully pinned release asset to Pinata for repository %d, tag %s, asset %s (Pinata ID: %s)\n", release.RepositoryId, release.TagName, attachment.Name, resp.Data.ID)
+							}
 						}
 
 						// Compute merkle root and file info

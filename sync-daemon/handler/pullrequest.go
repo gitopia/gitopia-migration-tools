@@ -25,14 +25,16 @@ type PullRequestEventHandler struct {
 	ipfsClusterClient ipfsclusterclient.Client
 	ipfsHttpApi       *rpc.HttpApi
 	storageManager    *shared.StorageManager
+	pinataClient      *shared.PinataClient
 }
 
-func NewPullRequestEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager) *PullRequestEventHandler {
+func NewPullRequestEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) *PullRequestEventHandler {
 	return &PullRequestEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		ipfsHttpApi:       ipfsHttpApi,
 		storageManager:    storageManager,
+		pinataClient:      pinataClient,
 	}
 }
 
@@ -188,6 +190,20 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 				h.storageManager.SetPackfileInfo(packfileInfo)
 				if err := h.storageManager.Save(); err != nil {
 					logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+				}
+				
+				// Pin to Pinata if enabled
+				if h.pinataClient != nil {
+					resp, err := h.pinataClient.PinFile(ctx, packfilePath, filepath.Base(packfilePath))
+					if err != nil {
+						logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to pin packfile to Pinata after merge")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"packfile":      filepath.Base(packfilePath),
+							"pinata_id":     resp.Data.ID,
+						}).Info("successfully pinned packfile to Pinata after merge")
+					}
 				}
 				
 				// Delete the repository directory after successful pinning and storage

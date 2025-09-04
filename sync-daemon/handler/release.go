@@ -31,13 +31,15 @@ type ReleaseEventHandler struct {
 	gitopiaClient     gc.Client
 	ipfsClusterClient ipfsclusterclient.Client
 	storageManager    *shared.StorageManager
+	pinataClient      *shared.PinataClient
 }
 
-func NewReleaseEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager) *ReleaseEventHandler {
+func NewReleaseEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) *ReleaseEventHandler {
 	return &ReleaseEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		storageManager:    storageManager,
+		pinataClient:      pinataClient,
 	}
 }
 
@@ -248,6 +250,26 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 		h.storageManager.SetReleaseAssetInfo(assetInfo)
 		if err := h.storageManager.Save(); err != nil {
 			logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+		}
+		
+		// Pin to Pinata if enabled
+		if h.pinataClient != nil {
+			name := fmt.Sprintf("release-%d-%s-%s-%s", event.RepositoryId, event.Tag, attachment.Name, attachment.Sha)
+			resp, err := h.pinataClient.PinFile(ctx, filePath, name)
+			if err != nil {
+				logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+					"repository_id": event.RepositoryId,
+					"tag":           event.Tag,
+					"attachment":    attachment.Name,
+				}).Error("failed to pin release asset to Pinata")
+			} else {
+				logger.FromContext(ctx).WithFields(logrus.Fields{
+					"repository_id": event.RepositoryId,
+					"tag":           event.Tag,
+					"attachment":    attachment.Name,
+					"pinata_id":     resp.Data.ID,
+				}).Info("successfully pinned release asset to Pinata")
+			}
 		}
 		
 		// Unpin older version if it exists and is different

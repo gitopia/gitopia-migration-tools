@@ -25,14 +25,16 @@ type TagEventHandler struct {
 	ipfsClusterClient ipfsclusterclient.Client
 	ipfsHttpApi       *rpc.HttpApi
 	storageManager    *shared.StorageManager
+	pinataClient      *shared.PinataClient
 }
 
-func NewTagEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager) *TagEventHandler {
+func NewTagEventHandler(gitopiaClient gc.Client, ipfsClusterClient ipfsclusterclient.Client, ipfsHttpApi *rpc.HttpApi, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) *TagEventHandler {
 	return &TagEventHandler{
 		gitopiaClient:     gitopiaClient,
 		ipfsClusterClient: ipfsClusterClient,
 		ipfsHttpApi:       ipfsHttpApi,
 		storageManager:    storageManager,
+		pinataClient:      pinataClient,
 	}
 }
 
@@ -178,6 +180,20 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 			h.storageManager.SetPackfileInfo(packfileInfo)
 			if err := h.storageManager.Save(); err != nil {
 				logger.FromContext(ctx).WithError(err).Error("failed to save storage manager")
+			}
+			
+			// Pin to Pinata if enabled
+			if h.pinataClient != nil {
+				resp, err := h.pinataClient.PinFile(ctx, packfilePath, filepath.Base(packfilePath))
+				if err != nil {
+					logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to pin packfile to Pinata")
+				} else {
+					logger.FromContext(ctx).WithFields(logrus.Fields{
+						"repository_id": repositoryID,
+						"packfile":      filepath.Base(packfilePath),
+						"pinata_id":     resp.Data.ID,
+					}).Info("successfully pinned packfile to Pinata")
+				}
 			}
 			
 			// Unpin older version if it exists and is different
