@@ -202,12 +202,29 @@ func (h *TagEventHandler) processRepository(ctx context.Context, repositoryID ui
 					logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
 						"repository_id": repositoryID,
 						"old_cid":       existingPackfile.CID,
-					}).Warn("failed to unpin older packfile version")
+					}).Warn("failed to unpin older packfile version from IPFS cluster")
 				} else {
 					logger.FromContext(ctx).WithFields(logrus.Fields{
 						"repository_id": repositoryID,
 						"old_cid":       existingPackfile.CID,
-					}).Info("successfully unpinned older packfile version")
+					}).Info("successfully unpinned older packfile version from IPFS cluster")
+				}
+				
+				// Unpin from Pinata if enabled
+				if h.pinataClient != nil && existingPackfile.Name != "" {
+					if err := h.pinataClient.UnpinFile(ctx, existingPackfile.Name); err != nil {
+						logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+							"old_name":      existingPackfile.Name,
+						}).Warn("failed to unpin older packfile version from Pinata")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+							"old_name":      existingPackfile.Name,
+						}).Info("successfully unpinned older packfile version from Pinata")
+					}
 				}
 			}
 			// Delete the repository directory after successful pinning and storage

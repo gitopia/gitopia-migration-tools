@@ -280,14 +280,34 @@ func (h *ReleaseEventHandler) processAttachment(ctx context.Context, event Relea
 					"tag":           event.Tag,
 					"attachment":    attachment.Name,
 					"old_cid":       existingAsset.CID,
-				}).Warn("failed to unpin older release asset version")
+				}).Warn("failed to unpin older release asset version from IPFS cluster")
 			} else {
 				logger.FromContext(ctx).WithFields(logrus.Fields{
 					"repository_id": event.RepositoryId,
 					"tag":           event.Tag,
 					"attachment":    attachment.Name,
 					"old_cid":       existingAsset.CID,
-				}).Info("successfully unpinned older release asset version")
+				}).Info("successfully unpinned older release asset version from IPFS cluster")
+			}
+			
+			// Unpin from Pinata if enabled
+			if h.pinataClient != nil {
+				oldName := fmt.Sprintf("release-%d-%s-%s-%s", event.RepositoryId, event.Tag, attachment.Name, existingAsset.SHA256)
+				if err := h.pinataClient.UnpinFile(ctx, oldName); err != nil {
+					logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+						"repository_id": event.RepositoryId,
+						"tag":           event.Tag,
+						"attachment":    attachment.Name,
+						"old_cid":       existingAsset.CID,
+					}).Warn("failed to unpin older release asset version from Pinata")
+				} else {
+					logger.FromContext(ctx).WithFields(logrus.Fields{
+						"repository_id": event.RepositoryId,
+						"tag":           event.Tag,
+						"attachment":    attachment.Name,
+						"old_cid":       existingAsset.CID,
+					}).Info("successfully unpinned older release asset version from Pinata")
+				}
 			}
 		}
 

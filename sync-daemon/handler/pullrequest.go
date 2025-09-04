@@ -178,9 +178,13 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 			if err != nil {
 				logger.FromContext(ctx).WithError(err).WithField("repository_id", repositoryID).Error("failed to compute file info for packfile")
 			} else {
+				// Get existing packfile info to unpin older version
+				existingPackfile := h.storageManager.GetPackfileInfo(repositoryID)
+				
 				// Store packfile information (sync daemon takes precedence)
 				packfileInfo := &shared.PackfileInfo{
 					RepositoryID: repositoryID,
+					Name:         filepath.Base(packfilePath),
 					CID:          cid,
 					RootHash:     rootHash,
 					Size:         size,
@@ -203,6 +207,38 @@ func (h *PullRequestEventHandler) processRepositoryAfterMerge(ctx context.Contex
 							"packfile":      filepath.Base(packfilePath),
 							"pinata_id":     resp.Data.ID,
 						}).Info("successfully pinned packfile to Pinata after merge")
+					}
+				}
+				
+				// Unpin older version if it exists and is different
+				if existingPackfile != nil && existingPackfile.CID != cid {
+					if err := shared.UnpinFile(h.ipfsClusterClient, existingPackfile.CID); err != nil {
+						logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+						}).Warn("failed to unpin older packfile version from IPFS cluster")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"old_cid":       existingPackfile.CID,
+						}).Info("successfully unpinned older packfile version from IPFS cluster")
+					}
+					
+					// Unpin from Pinata if enabled
+					if h.pinataClient != nil && existingPackfile.Name != "" {
+						if err := h.pinataClient.UnpinFile(ctx, existingPackfile.Name); err != nil {
+							logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+								"repository_id": repositoryID,
+								"old_cid":       existingPackfile.CID,
+								"old_name":      existingPackfile.Name,
+							}).Warn("failed to unpin older packfile version from Pinata")
+						} else {
+							logger.FromContext(ctx).WithFields(logrus.Fields{
+								"repository_id": repositoryID,
+								"old_cid":       existingPackfile.CID,
+								"old_name":      existingPackfile.Name,
+							}).Info("successfully unpinned older packfile version from Pinata")
+						}
 					}
 				}
 				

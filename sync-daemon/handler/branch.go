@@ -203,12 +203,29 @@ func (h *BranchEventHandler) processRepository(ctx context.Context, repositoryID
 						logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
 							"repository_id": repositoryID,
 							"old_cid":       existingPackfile.CID,
-						}).Warn("failed to unpin older packfile version")
+						}).Warn("failed to unpin older packfile version from IPFS cluster")
 					} else {
 						logger.FromContext(ctx).WithFields(logrus.Fields{
 							"repository_id": repositoryID,
 							"old_cid":       existingPackfile.CID,
-						}).Info("successfully unpinned older packfile version")
+						}).Info("successfully unpinned older packfile version from IPFS cluster")
+					}
+					
+					// Unpin from Pinata if enabled
+					if h.pinataClient != nil && existingPackfile.Name != "" {
+						if err := h.pinataClient.UnpinFile(ctx, existingPackfile.Name); err != nil {
+							logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+								"repository_id": repositoryID,
+								"old_cid":       existingPackfile.CID,
+								"old_name":      existingPackfile.Name,
+							}).Warn("failed to unpin older packfile version from Pinata")
+						} else {
+							logger.FromContext(ctx).WithFields(logrus.Fields{
+								"repository_id": repositoryID,
+								"old_cid":       existingPackfile.CID,
+								"old_name":      existingPackfile.Name,
+							}).Info("successfully unpinned older packfile version from Pinata")
+						}
 					}
 				}
 				
@@ -342,13 +359,30 @@ func (h *BranchEventHandler) processLFSObjects(ctx context.Context, repositoryID
 						"repository_id": repositoryID,
 						"oid":           oid,
 						"old_cid":       existingLFS.CID,
-					}).Warn("failed to unpin older LFS object version")
+					}).Warn("failed to unpin older LFS object version from IPFS cluster")
 				} else {
 					logger.FromContext(ctx).WithFields(logrus.Fields{
 						"repository_id": repositoryID,
 						"oid":           oid,
 						"old_cid":       existingLFS.CID,
-					}).Info("successfully unpinned older LFS object version")
+					}).Info("successfully unpinned older LFS object version from IPFS cluster")
+				}
+				
+				// Unpin from Pinata if enabled
+				if h.pinataClient != nil {
+					if err := h.pinataClient.UnpinFile(ctx, existingLFS.OID); err != nil {
+						logger.FromContext(ctx).WithError(err).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"oid":           oid,
+							"old_cid":       existingLFS.CID,
+						}).Warn("failed to unpin older LFS object version from Pinata")
+					} else {
+						logger.FromContext(ctx).WithFields(logrus.Fields{
+							"repository_id": repositoryID,
+							"oid":           oid,
+							"old_cid":       existingLFS.CID,
+						}).Info("successfully unpinned older LFS object version from Pinata")
+					}
 				}
 			}
 			

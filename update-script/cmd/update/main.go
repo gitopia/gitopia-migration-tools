@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"time"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/keys"
@@ -56,7 +54,7 @@ func NewBatchTxManager(client gc.Client, batchSize int) *BatchTxManager {
 
 func (btm *BatchTxManager) AddToBatch(ctx context.Context, msg sdk.Msg) error {
 	btm.txQueue = append(btm.txQueue, msg)
-	
+
 	// Process batch when it reaches the batch size
 	if len(btm.txQueue) >= btm.batchSize {
 		return btm.ProcessBatch(ctx)
@@ -68,17 +66,17 @@ func (btm *BatchTxManager) ProcessBatch(ctx context.Context) error {
 	if len(btm.txQueue) == 0 {
 		return nil
 	}
-	
+
 	fmt.Printf("Processing batch of %d transactions...\n", len(btm.txQueue))
-	
+
 	// Send all messages in a single transaction
 	_, err := btm.client.BroadcastTx(ctx, btm.txQueue...)
 	if err != nil {
 		return errors.Wrap(err, "failed to broadcast batch transaction")
 	}
-	
+
 	fmt.Printf("Successfully processed batch of %d transactions\n", len(btm.txQueue))
-	
+
 	// Clear the queue
 	btm.txQueue = btm.txQueue[:0]
 	return nil
@@ -146,12 +144,12 @@ func saveProgress(progress *UpdateProgress) error {
 // processRepositoryPackfiles processes repository packfiles using stored data
 func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
 	allPackfiles := storageManager.GetAllPackfileInfo()
-	
+
 	for _, packfileInfo := range allPackfiles {
 		if progress.ProcessedRepos[packfileInfo.RepositoryID] {
 			continue // Skip already processed
 		}
-		
+
 		msg := &storagetypes.MsgUpdateRepositoryPackfile{
 			Creator:      batchMgr.client.ClientAddress(),
 			RepositoryId: packfileInfo.RepositoryID,
@@ -161,25 +159,25 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 			Size_:        uint64(packfileInfo.Size),
 			OldCid:       "", // Empty for initial update
 		}
-		
+
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
 			progress.FailedRepos[packfileInfo.RepositoryID] = err.Error()
 			fmt.Printf("Failed to add packfile update for repo %d: %v\n", packfileInfo.RepositoryID, err)
 			continue
 		}
-		
+
 		progress.ProcessedRepos[packfileInfo.RepositoryID] = true
 		progress.TotalProcessed++
 		fmt.Printf("Added packfile update for repository %d to batch\n", packfileInfo.RepositoryID)
 	}
-	
+
 	return nil
 }
 
 // processReleaseAssets processes release assets using stored data
 func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
 	allReleaseAssets := storageManager.GetAllReleaseAssetInfo()
-	
+
 	// Group assets by repository and tag
 	assetsByRelease := make(map[string][]*shared.ReleaseAssetInfo)
 	for _, assetInfo := range allReleaseAssets {
@@ -189,12 +187,12 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 		}
 		assetsByRelease[releaseKey] = append(assetsByRelease[releaseKey], assetInfo)
 	}
-	
+
 	for releaseKey, assets := range assetsByRelease {
 		if len(assets) == 0 {
 			continue
 		}
-		
+
 		// Convert to storage types
 		var assetUpdates []*storagetypes.ReleaseAssetUpdate
 		for _, asset := range assets {
@@ -207,38 +205,38 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 				OldCid:   "", // Empty for initial update
 			})
 		}
-		
+
 		msg := &storagetypes.MsgUpdateReleaseAssets{
 			Creator:      batchMgr.client.ClientAddress(),
 			RepositoryId: assets[0].RepositoryID,
 			TagName:      assets[0].TagName,
 			Assets:       assetUpdates,
 		}
-		
+
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
 			progress.FailedReleases[releaseKey] = err.Error()
 			fmt.Printf("Failed to add release assets update for %s: %v\n", releaseKey, err)
 			continue
 		}
-		
+
 		progress.ProcessedReleases[releaseKey] = true
 		progress.TotalProcessed++
 		fmt.Printf("Added release assets update for %s to batch (%d assets)\n", releaseKey, len(assets))
 	}
-	
+
 	return nil
 }
 
 // processLFSObjects processes LFS objects using stored data
 func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
 	allLFSObjects := storageManager.GetAllLFSObjectInfo()
-	
+
 	for _, lfsInfo := range allLFSObjects {
 		lfsKey := fmt.Sprintf("%d-%s", lfsInfo.RepositoryID, lfsInfo.OID)
 		if progress.ProcessedLFSObjects[lfsKey] {
 			continue // Skip already processed
 		}
-		
+
 		msg := &storagetypes.MsgUpdateLFSObject{
 			Creator:      batchMgr.client.ClientAddress(),
 			RepositoryId: lfsInfo.RepositoryID,
@@ -247,18 +245,18 @@ func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageMan
 			RootHash:     lfsInfo.RootHash,
 			Size_:        uint64(lfsInfo.Size),
 		}
-		
+
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
 			progress.FailedLFSObjects[lfsKey] = err.Error()
 			fmt.Printf("Failed to add LFS object update for %s: %v\n", lfsKey, err)
 			continue
 		}
-		
+
 		progress.ProcessedLFSObjects[lfsKey] = true
 		progress.TotalProcessed++
 		fmt.Printf("Added LFS object update for %s to batch\n", lfsKey)
 	}
-	
+
 	return nil
 }
 
@@ -272,98 +270,98 @@ func main() {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			
+
 			// Load progress
 			progress, err := loadProgress()
 			if err != nil {
 				return errors.Wrap(err, "failed to load progress")
 			}
-			
+
 			// Initialize storage manager
 			storageManager := shared.NewStorageManager(viper.GetString("WORKING_DIR"))
 			if err := storageManager.Load(); err != nil {
 				return errors.Wrap(err, "failed to load storage manager")
 			}
-			
+
 			// Initialize Gitopia client
 			clientCtx := client.GetClientContextFromCmd(cmd)
 			txf, err := tx.NewFactoryCLI(clientCtx, cmd.Flags())
 			if err != nil {
 				return errors.Wrap(err, "error initializing tx factory")
 			}
-			
+
 			gitopiaClient, err := gc.NewClient(ctx, clientCtx, txf)
 			if err != nil {
 				return err
 			}
 			defer gitopiaClient.Close()
-			
+
 			// Initialize batch transaction manager
 			batchMgr := NewBatchTxManager(gitopiaClient, BATCH_SIZE)
-			
+
 			fmt.Printf("Starting batch update process with batch size: %d\n", BATCH_SIZE)
-			
+
 			// Process repository packfiles
 			fmt.Println("Processing repository packfiles...")
 			if err := processRepositoryPackfiles(ctx, batchMgr, storageManager, progress); err != nil {
 				return errors.Wrap(err, "failed to process repository packfiles")
 			}
-			
+
 			// Process release assets
 			fmt.Println("Processing release assets...")
 			if err := processReleaseAssets(ctx, batchMgr, storageManager, progress); err != nil {
 				return errors.Wrap(err, "failed to process release assets")
 			}
-			
+
 			// Process LFS objects
 			fmt.Println("Processing LFS objects...")
 			if err := processLFSObjects(ctx, batchMgr, storageManager, progress); err != nil {
 				return errors.Wrap(err, "failed to process LFS objects")
 			}
-			
+
 			// Flush any remaining messages in the batch
 			if err := batchMgr.FlushBatch(ctx); err != nil {
 				return errors.Wrap(err, "failed to flush final batch")
 			}
-			
+
 			// Save final progress
 			if err := saveProgress(progress); err != nil {
 				return errors.Wrap(err, "failed to save final progress")
 			}
-			
+
 			fmt.Printf("Update script completed successfully! Total processed: %d\n", progress.TotalProcessed)
-			fmt.Printf("Failed repos: %d, Failed releases: %d, Failed LFS objects: %d\n", 
+			fmt.Printf("Failed repos: %d, Failed releases: %d, Failed LFS objects: %d\n",
 				len(progress.FailedRepos), len(progress.FailedReleases), len(progress.FailedLFSObjects))
-			
+
 			return nil
 		},
 	}
-	
+
 	// Add flags
 	rootCmd.Flags().String("from", "", "Name or address of private key with which to sign")
 	rootCmd.Flags().String("keyring-backend", "", "Select keyring's backend (os|file|kwallet|pass|test|memory)")
-	
+
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
-	
+
 	// Initialize context with logger
 	ctx := logger.InitLogger(context.Background(), AppName)
 	ctx = context.WithValue(ctx, client.ClientContextKey, &client.Context{})
-	
+
 	logger.FromContext(ctx).SetOutput(os.Stdout)
-	
+
 	viper.SetConfigFile("config.toml")
 	viper.ReadInConfig()
-	
+
 	gc.WithAppName(AppName)
 	gc.WithChainId(viper.GetString("CHAIN_ID"))
 	gc.WithGasPrices(viper.GetString("GAS_PRICES"))
 	gc.WithGitopiaAddr(viper.GetString("GITOPIA_ADDR"))
 	gc.WithTmAddr(viper.GetString("TM_ADDR"))
 	gc.WithWorkingDir(viper.GetString("WORKING_DIR"))
-	
+
 	rootCmd.AddCommand(keys.Commands(viper.GetString("WORKING_DIR")))
-	
+
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
