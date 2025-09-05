@@ -815,15 +815,6 @@ func main() {
 
 				fmt.Printf("Release %s has %d attachments to process\n", release.TagName, len(release.Attachments))
 
-				// Fetch repository
-				repository, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
-					Id: release.RepositoryId,
-				})
-				if err != nil {
-					fmt.Printf("Error getting repository for release %s: %v\n", release.TagName, err)
-					return errors.Wrap(err, "error getting repository")
-				}
-
 				for i, attachment := range release.Attachments {
 					fmt.Printf("Processing attachment %d/%d: %s\n", i+1, len(release.Attachments), attachment.Name)
 					// Check if release asset already exists in database (might be processed by sync daemon)
@@ -833,43 +824,16 @@ func main() {
 						continue
 					}
 
-					// Download release asset
-					attachmentUrl := fmt.Sprintf("%s/releases/%s/%s/%s/%s",
-						viper.GetString("GIT_SERVER_HOST"),
-						repository.Repository.Owner.Id,
-						repository.Repository.Name,
-						release.TagName,
-						attachment.Name)
-
+					// Use attachment file from attachments directory (filename is the SHA)
 					filePath := filepath.Join(attachmentDir, attachment.Sha)
 
-					// Create context with timeout for wget (20 minutes)
-					wgetCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
-					defer cancel()
-
-					cmd := exec.CommandContext(wgetCtx, "wget", attachmentUrl, "-O", filePath)
-					output, err := cmd.CombinedOutput()
-					if err != nil {
-						fmt.Printf("Error downloading release asset %s: %v\nOutput: %s\n", attachment.Name, err, string(output))
-						return errors.Wrapf(err, "error downloading release asset: %s", string(output))
+					// Check if attachment file exists
+					if _, err := os.Stat(filePath); os.IsNotExist(err) {
+						fmt.Printf("Attachment file %s not found in attachments directory: %v\n", attachment.Sha, err)
+						return errors.Wrapf(err, "attachment file %s not found", attachment.Sha)
 					}
 
-					// Verify sha256 with timeout (5 minutes)
-					shaCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-					defer cancel()
-
-					cmd = exec.CommandContext(shaCtx, "sha256sum", filePath)
-					output, err = cmd.CombinedOutput()
-					if err != nil {
-						fmt.Printf("Error verifying sha256 for attachment %s: %v\n", attachment.Name, err)
-						return errors.Wrap(err, "error verifying sha256 for attachment")
-					}
-					calculatedHash := strings.Fields(string(output))[0]
-					if calculatedHash != attachment.Sha {
-						err := errors.Errorf("SHA256 mismatch for attachment %s: %s != %s", attachment.Name, calculatedHash, attachment.Sha)
-						fmt.Printf("SHA256 mismatch error: %v\n", err)
-						return err
-					}
+					fmt.Printf("Using attachment file %s from attachments directory\n", attachment.Sha)
 
 					// Pin to IPFS cluster
 					cid, err := shared.PinFile(ipfsClusterClient, filePath)
