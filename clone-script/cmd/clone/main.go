@@ -32,6 +32,7 @@ const (
 	AccountPubKeyPrefix  = AccountAddressPrefix + sdk.PrefixPublic
 	AppName              = "gitopia-clone-script"
 	ProgressFile         = "gitopia_clone_progress.json"
+	ReleaseProgressFile  = "gitopia_clone_releases_progress.json"
 )
 
 type CloneProgress struct {
@@ -48,8 +49,13 @@ type CloneProgress struct {
 	CurrentBatchReleases   []uint64          `json:"current_batch_releases"`
 }
 
-func loadProgress() (*CloneProgress, error) {
-	if _, err := os.Stat(ProgressFile); os.IsNotExist(err) {
+func loadProgress(releasesOnly bool) (*CloneProgress, error) {
+	progressFile := ProgressFile
+	if releasesOnly {
+		progressFile = ReleaseProgressFile
+	}
+	
+	if _, err := os.Stat(progressFile); os.IsNotExist(err) {
 		return &CloneProgress{
 			FailedRepos:       make(map[uint64]string),
 			FailedReleases:    make(map[uint64]string),
@@ -57,7 +63,7 @@ func loadProgress() (*CloneProgress, error) {
 		}, nil
 	}
 
-	data, err := os.ReadFile(ProgressFile)
+	data, err := os.ReadFile(progressFile)
 	if err != nil {
 		return nil, err
 	}
@@ -80,12 +86,17 @@ func loadProgress() (*CloneProgress, error) {
 	return &progress, nil
 }
 
-func saveProgress(progress *CloneProgress) error {
+func saveProgress(progress *CloneProgress, releasesOnly bool) error {
+	progressFile := ProgressFile
+	if releasesOnly {
+		progressFile = ReleaseProgressFile
+	}
+	
 	data, err := json.Marshal(progress)
 	if err != nil {
 		return errors.Wrap(err, "failed to marshal progress")
 	}
-	return os.WriteFile(ProgressFile, data, 0644)
+	return os.WriteFile(progressFile, data, 0644)
 }
 
 // Helper function to check if a repository should be processed
@@ -530,6 +541,12 @@ func main() {
 			return gc.CommandInit(cmd, AppName)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Get the releases-only flag
+			releasesOnly, err := cmd.Flags().GetBool("releases-only")
+			if err != nil {
+				return errors.Wrap(err, "failed to get releases-only flag")
+			}
+
 			// Create required directories
 			gitDir := viper.GetString("GIT_REPOS_DIR")
 			if err := os.MkdirAll(gitDir, 0755); err != nil {
@@ -542,7 +559,7 @@ func main() {
 			}
 
 			// Load progress
-			progress, err := loadProgress()
+			progress, err := loadProgress(releasesOnly)
 			if err != nil {
 				return errors.Wrap(err, "failed to load progress")
 			}
@@ -588,69 +605,74 @@ func main() {
 				log.Println("Pinata JWT token not provided, skipping Pinata uploads")
 			}
 
-			// Process repositories using direct ID queries (0 to 62973)
-			var processedCount int
-			const maxRepositoryID uint64 = 62973
-			fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
+			// Process repositories only if not in releases-only mode
+			if !releasesOnly {
+				// Process repositories using direct ID queries (0 to 62973)
+				var processedCount int
+				const maxRepositoryID uint64 = 62973
+				fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
 
-			// Determine starting ID based on progress
-			startID := uint64(0)
-			if progress.LastProcessedRepoID > 0 {
-				startID = progress.LastProcessedRepoID + 1
-			}
-
-			for repoID := startID; repoID <= maxRepositoryID; repoID++ {
-				// Use improved resume logic
-				if !shouldProcessRepo(progress, repoID) {
-					processedCount++
-					continue
+				// Determine starting ID based on progress
+				startID := uint64(0)
+				if progress.LastProcessedRepoID > 0 {
+					startID = progress.LastProcessedRepoID + 1
 				}
 
-				fmt.Printf("Querying repository ID %d\n", repoID)
-				repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
-					Id: repoID,
-				})
-				if err != nil {
-					// Repository might not exist, skip and continue
-					fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
-					processedCount++
-					continue
-				}
+				for repoID := startID; repoID <= maxRepositoryID; repoID++ {
+					// Use improved resume logic
+					if !shouldProcessRepo(progress, repoID) {
+						processedCount++
+						continue
+					}
 
-				repository := repositoryResp.Repository
+					fmt.Printf("Querying repository ID %d\n", repoID)
+					repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+						Id: repoID,
+					})
+					if err != nil {
+						// Repository might not exist, skip and continue
+						fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
+						processedCount++
+						continue
+					}
 
-				fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
+					repository := repositoryResp.Repository
 
-				// Use atomic processing function
-				if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
-					progress.FailedRepos[repository.Id] = err.Error()
-					progress.LastFailedRepo = repository.Id
-					if err := saveProgress(progress); err != nil {
+					fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
+
+					// Use atomic processing function
+					if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
+						progress.FailedRepos[repository.Id] = err.Error()
+						progress.LastFailedRepo = repository.Id
+						if err := saveProgress(progress, releasesOnly); err != nil {
+							return errors.Wrap(err, "failed to save progress")
+						}
+						return errors.Wrapf(err, "error processing repository %d", repository.Id)
+					}
+
+					// Mark repository as successfully processed
+					delete(progress.FailedRepos, repository.Id)
+					progress.LastProcessedRepoID = repository.Id
+					if err := saveProgress(progress, releasesOnly); err != nil {
 						return errors.Wrap(err, "failed to save progress")
 					}
-					return errors.Wrapf(err, "error processing repository %d", repository.Id)
+
+					// Save storage manager state
+					if err := storageManager.Save(); err != nil {
+						return errors.Wrap(err, "failed to save storage manager")
+					}
+
+					processedCount++
+					fmt.Printf("Successfully cloned repository %d\n", repository.Id)
 				}
 
-				// Mark repository as successfully processed
-				delete(progress.FailedRepos, repository.Id)
-				progress.LastProcessedRepoID = repository.Id
-				if err := saveProgress(progress); err != nil {
-					return errors.Wrap(err, "failed to save progress")
-				}
-
-				// Save storage manager state
-				if err := storageManager.Save(); err != nil {
-					return errors.Wrap(err, "failed to save storage manager")
-				}
-
-				processedCount++
-				fmt.Printf("Successfully cloned repository %d\n", repository.Id)
+				fmt.Printf("Repository processing complete - processed all IDs from 0 to %d\n", maxRepositoryID)
+			} else {
+				fmt.Println("Skipping repository processing (releases-only mode)")
 			}
 
-			fmt.Printf("Repository processing complete - processed all IDs from 0 to %d\n", maxRepositoryID)
-
 			// Process releases (all fetched in single request)
-			processedCount = 0
+			var processedCount int
 			fmt.Printf("Starting release processing\n")
 
 			releases, err := gitopiaClient.QueryClient().Gitopia.ReleaseAll(ctx, &gitopiatypes.QueryAllReleaseRequest{})
@@ -685,7 +707,7 @@ func main() {
 				if err != nil {
 					progress.FailedReleases[release.Id] = err.Error()
 					progress.LastFailedRelease = release.Id
-					if err := saveProgress(progress); err != nil {
+					if err := saveProgress(progress, releasesOnly); err != nil {
 						return errors.Wrap(err, "failed to save progress")
 					}
 					return errors.Wrap(err, "error getting repository")
@@ -718,7 +740,7 @@ func main() {
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress); err != nil {
+						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
 						return errors.Wrapf(err, "error downloading release asset: %s", string(output))
@@ -729,11 +751,11 @@ func main() {
 					defer cancel()
 					
 					cmd = exec.CommandContext(shaCtx, "sha256sum", filePath)
-					output, err = cmd.Output()
+					output, err = cmd.CombinedOutput()
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress); err != nil {
+						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
 						return errors.Wrap(err, "error verifying sha256 for attachment")
@@ -743,7 +765,7 @@ func main() {
 						err := errors.Errorf("SHA256 mismatch for attachment %s: %s != %s", attachment.Name, calculatedHash, attachment.Sha)
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress); err != nil {
+						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
 						return err
@@ -754,7 +776,7 @@ func main() {
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress); err != nil {
+						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
 						return errors.Wrap(err, "error pinning attachment")
@@ -776,7 +798,7 @@ func main() {
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress); err != nil {
+						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
 						return errors.Wrapf(err, "error computing file info for attachment %s", attachment.Name)
@@ -810,7 +832,7 @@ func main() {
 				delete(progress.FailedReleases, release.Id)
 				progress.ProcessedReleases[release.Id] = true
 				progress.LastProcessedReleaseID = release.Id
-				if err := saveProgress(progress); err != nil {
+				if err := saveProgress(progress, releasesOnly); err != nil {
 					return errors.Wrap(err, "failed to save progress")
 				}
 
@@ -832,6 +854,7 @@ func main() {
 	// Add flags
 	rootCmd.Flags().String("from", "", "Name or address of private key with which to sign")
 	rootCmd.Flags().String("keyring-backend", "", "Select keyring's backend (os|file|kwallet|pass|test|memory)")
+	rootCmd.Flags().Bool("releases-only", false, "Process only releases, skip repository cloning")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
