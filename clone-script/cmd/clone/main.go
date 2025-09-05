@@ -17,7 +17,6 @@ import (
 	"github.com/cosmos/cosmos-sdk/client/keys"
 	"github.com/cosmos/cosmos-sdk/client/tx"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/cosmos/cosmos-sdk/types/query"
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
 	"github.com/gitopia/gitopia-migration-tools/shared"
@@ -592,283 +591,241 @@ func main() {
 				log.Println("Pinata JWT token not provided, skipping Pinata uploads")
 			}
 
-			// Process repositories
+			// Process repositories using direct ID queries (0 to 62973)
 			var processedCount int
-			var totalRepositories uint64
-			nextKey := progress.RepositoryNextKey
-			fmt.Printf("Starting repository processing with next key: %x\n", nextKey)
+			const maxRepositoryID uint64 = 62973
+			fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
 
-			for {
-				fmt.Printf("Querying repositories with next key: %x\n", nextKey)
-				repositories, err := gitopiaClient.QueryClient().Gitopia.RepositoryAll(ctx, &gitopiatypes.QueryAllRepositoryRequest{
-					Pagination: &query.PageRequest{
-						Key: nextKey,
-					},
+			// Determine starting ID based on progress
+			startID := uint64(0)
+			if progress.LastProcessedRepoID > 0 {
+				startID = progress.LastProcessedRepoID + 1
+			}
+
+			for repoID := startID; repoID <= maxRepositoryID; repoID++ {
+				// Use improved resume logic
+				if !shouldProcessRepo(progress, repoID) {
+					processedCount++
+					continue
+				}
+
+				fmt.Printf("Querying repository ID %d\n", repoID)
+				repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+					Id: repoID,
 				})
 				if err != nil {
-					return errors.Wrap(err, "failed to get repositories")
+					// Repository might not exist, skip and continue
+					fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
+					processedCount++
+					continue
 				}
 
-				if totalRepositories == 0 {
-					totalRepositories = repositories.Pagination.Total
-					fmt.Printf("Total repositories to process: %d\n", totalRepositories)
+				repository := repositoryResp.Repository
+
+				// Validate fork dependencies
+				if err := validateForkDependency(progress, repository, gitDir); err != nil {
+					fmt.Printf("Skipping fork repository %d due to dependency issue: %v\n", repository.Id, err)
+					processedCount++
+					continue
 				}
 
-				// Track current batch for better recovery
-				var currentBatchRepos []uint64
-				for _, repo := range repositories.Repository {
-					currentBatchRepos = append(currentBatchRepos, repo.Id)
-				}
-				progress.CurrentBatchRepos = currentBatchRepos
-				if err := saveProgress(progress); err != nil {
-					return errors.Wrap(err, "failed to save batch progress")
-				}
+				fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
 
-				for _, repository := range repositories.Repository {
-					// Use improved resume logic
-					if !shouldProcessRepo(progress, repository.Id) {
-						processedCount++
-						continue
-					}
-
-					// Validate fork dependencies
-					if err := validateForkDependency(progress, repository, gitDir); err != nil {
-						fmt.Printf("Skipping fork repository %d due to dependency issue: %v\n", repository.Id, err)
-						processedCount++
-						continue
-					}
-
-					fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, totalRepositories)
-
-					// Use atomic processing function
-					if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
-						progress.FailedRepos[repository.Id] = err.Error()
-						progress.LastFailedRepo = repository.Id
-						if err := saveProgress(progress); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
-						return errors.Wrapf(err, "error processing repository %d", repository.Id)
-					}
-
-					// Mark repository as successfully processed
-					delete(progress.FailedRepos, repository.Id)
-					progress.ProcessedRepos[repository.Id] = true
-					progress.LastProcessedRepoID = repository.Id
-					progress.RepositoryNextKey = nextKey
+				// Use atomic processing function
+				if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
+					progress.FailedRepos[repository.Id] = err.Error()
+					progress.LastFailedRepo = repository.Id
 					if err := saveProgress(progress); err != nil {
 						return errors.Wrap(err, "failed to save progress")
 					}
-
-					// Save storage manager state
-					if err := storageManager.Save(); err != nil {
-						return errors.Wrap(err, "failed to save storage manager")
-					}
-
-					processedCount++
-					fmt.Printf("Successfully cloned repository %d\n", repository.Id)
+					return errors.Wrapf(err, "error processing repository %d", repository.Id)
 				}
 
-				if repositories.Pagination == nil || len(repositories.Pagination.NextKey) == 0 {
-					fmt.Printf("Repository processing complete - no more pages\n")
-					break
+				// Mark repository as successfully processed
+				delete(progress.FailedRepos, repository.Id)
+				progress.ProcessedRepos[repository.Id] = true
+				progress.LastProcessedRepoID = repository.Id
+				if err := saveProgress(progress); err != nil {
+					return errors.Wrap(err, "failed to save progress")
 				}
-				nextKey = repositories.Pagination.NextKey
-				fmt.Printf("Moving to next repository page with key: %x\n", nextKey)
+
+				// Save storage manager state
+				if err := storageManager.Save(); err != nil {
+					return errors.Wrap(err, "failed to save storage manager")
+				}
+
+				processedCount++
+				fmt.Printf("Successfully cloned repository %d\n", repository.Id)
 			}
 
-			// Process releases
-			processedCount = 0
-			var totalReleases uint64
-			nextKey = progress.ReleaseNextKey
-			fmt.Printf("Starting release processing with next key: %x\n", nextKey)
+			fmt.Printf("Repository processing complete - processed all IDs from 0 to %d\n", maxRepositoryID)
 
-			for {
-				fmt.Printf("Querying releases with next key: %x\n", nextKey)
-				releases, err := gitopiaClient.QueryClient().Gitopia.ReleaseAll(ctx, &gitopiatypes.QueryAllReleaseRequest{
-					Pagination: &query.PageRequest{
-						Key: nextKey,
-					},
+			// Process releases (all fetched in single request)
+			processedCount = 0
+			fmt.Printf("Starting release processing\n")
+
+			releases, err := gitopiaClient.QueryClient().Gitopia.ReleaseAll(ctx, &gitopiatypes.QueryAllReleaseRequest{})
+			if err != nil {
+				return errors.Wrap(err, "failed to get releases")
+			}
+
+			totalReleases := uint64(len(releases.Release))
+			fmt.Printf("Total releases to process: %d\n", totalReleases)
+
+			for _, release := range releases.Release {
+				// Use improved resume logic
+				if !shouldProcessRelease(progress, release.Id) {
+					processedCount++
+					continue
+				}
+
+				fmt.Printf("Processing release %s for repository %d (%d/%d)\n", release.TagName, release.RepositoryId, processedCount+1, totalReleases)
+
+				if len(release.Attachments) == 0 {
+					// Mark release as processed even if no attachments
+					progress.ProcessedReleases[release.Id] = true
+					progress.LastProcessedReleaseID = release.Id
+					processedCount++
+					continue
+				}
+
+				// Fetch repository
+				repository, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+					Id: release.RepositoryId,
 				})
 				if err != nil {
-					return errors.Wrap(err, "failed to get releases")
+					progress.FailedReleases[release.Id] = err.Error()
+					progress.LastFailedRelease = release.Id
+					if err := saveProgress(progress); err != nil {
+						return errors.Wrap(err, "failed to save progress")
+					}
+					return errors.Wrap(err, "error getting repository")
 				}
 
-				if totalReleases == 0 {
-					totalReleases = releases.Pagination.Total
-					fmt.Printf("Total releases to process: %d\n", totalReleases)
-				}
-
-				// Track current batch for better recovery
-				var currentBatchReleases []uint64
-				for _, rel := range releases.Release {
-					currentBatchReleases = append(currentBatchReleases, rel.Id)
-				}
-				progress.CurrentBatchReleases = currentBatchReleases
-				if err := saveProgress(progress); err != nil {
-					return errors.Wrap(err, "failed to save batch progress")
-				}
-
-				for _, release := range releases.Release {
-					// Use improved resume logic
-					if !shouldProcessRelease(progress, release.Id) {
-						processedCount++
+				for _, attachment := range release.Attachments {
+					// Check if release asset already exists in database (might be processed by sync daemon)
+					existingAsset := storageManager.GetReleaseAssetInfo(release.RepositoryId, release.TagName, attachment.Name)
+					if existingAsset != nil && existingAsset.UpdatedBy == "sync" {
+						fmt.Printf("Release asset %s for repository %d tag %s already processed by sync daemon, skipping\n", attachment.Name, release.RepositoryId, release.TagName)
 						continue
 					}
 
-					fmt.Printf("Processing release %s for repository %d (%d/%d)\n", release.TagName, release.RepositoryId, processedCount+1, totalReleases)
+					// Download release asset
+					attachmentUrl := fmt.Sprintf("%s/releases/%s/%s/%s/%s",
+						viper.GetString("GIT_SERVER_HOST"),
+						repository.Repository.Owner.Id,
+						repository.Repository.Name,
+						release.TagName,
+						attachment.Name)
 
-					if len(release.Attachments) == 0 {
-						// Mark release as processed even if no attachments
-						progress.ProcessedReleases[release.Id] = true
-						progress.LastProcessedReleaseID = release.Id
-						processedCount++
-						continue
-					}
-
-					// Fetch repository
-					repository, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
-						Id: release.RepositoryId,
-					})
+					filePath := filepath.Join(attachmentDir, attachment.Sha)
+					cmd := exec.Command("wget", attachmentUrl, "-O", filePath)
+					output, err := cmd.CombinedOutput()
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
 						progress.LastFailedRelease = release.Id
 						if err := saveProgress(progress); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
-						return errors.Wrap(err, "error getting repository")
+						return errors.Wrapf(err, "error downloading release asset: %s", string(output))
 					}
 
-					for _, attachment := range release.Attachments {
-						// Check if release asset already exists in database (might be processed by sync daemon)
-						existingAsset := storageManager.GetReleaseAssetInfo(release.RepositoryId, release.TagName, attachment.Name)
-						if existingAsset != nil && existingAsset.UpdatedBy == "sync" {
-							fmt.Printf("Release asset %s for repository %d tag %s already processed by sync daemon, skipping\n", attachment.Name, release.RepositoryId, release.TagName)
-							continue
+					// Verify sha256
+					cmd = exec.Command("sha256sum", filePath)
+					output, err = cmd.Output()
+					if err != nil {
+						progress.FailedReleases[release.Id] = err.Error()
+						progress.LastFailedRelease = release.Id
+						if err := saveProgress(progress); err != nil {
+							return errors.Wrap(err, "failed to save progress")
 						}
+						return errors.Wrap(err, "error verifying sha256 for attachment")
+					}
+					calculatedHash := strings.Fields(string(output))[0]
+					if calculatedHash != attachment.Sha {
+						err := errors.Errorf("SHA256 mismatch for attachment %s: %s != %s", attachment.Name, calculatedHash, attachment.Sha)
+						progress.FailedReleases[release.Id] = err.Error()
+						progress.LastFailedRelease = release.Id
+						if err := saveProgress(progress); err != nil {
+							return errors.Wrap(err, "failed to save progress")
+						}
+						return err
+					}
 
-						// Download release asset
-						attachmentUrl := fmt.Sprintf("%s/releases/%s/%s/%s/%s",
-							viper.GetString("GIT_SERVER_HOST"),
-							repository.Repository.Owner.Id,
-							repository.Repository.Name,
-							release.TagName,
-							attachment.Name)
+					// Pin to IPFS cluster
+					cid, err := shared.PinFile(ipfsClusterClient, filePath)
+					if err != nil {
+						progress.FailedReleases[release.Id] = err.Error()
+						progress.LastFailedRelease = release.Id
+						if err := saveProgress(progress); err != nil {
+							return errors.Wrap(err, "failed to save progress")
+						}
+						return errors.Wrap(err, "error pinning attachment")
+					}
 
-						filePath := filepath.Join(attachmentDir, attachment.Sha)
-						cmd := exec.Command("wget", attachmentUrl, "-O", filePath)
-						output, err := cmd.CombinedOutput()
+					// Pin to Pinata if enabled
+					if pinataClient != nil {
+						name := fmt.Sprintf("release-%d-%s-%s-%s", release.RepositoryId, release.TagName, attachment.Name, attachment.Sha)
+						resp, err := pinataClient.PinFile(ctx, filePath, name)
 						if err != nil {
-							progress.FailedReleases[release.Id] = err.Error()
-							progress.LastFailedRelease = release.Id
-							if err := saveProgress(progress); err != nil {
-								return errors.Wrap(err, "failed to save progress")
-							}
-							return errors.Wrapf(err, "error downloading release asset: %s", string(output))
-						}
-
-						// Verify sha256
-						cmd = exec.Command("sha256sum", filePath)
-						output, err = cmd.Output()
-						if err != nil {
-							progress.FailedReleases[release.Id] = err.Error()
-							progress.LastFailedRelease = release.Id
-							if err := saveProgress(progress); err != nil {
-								return errors.Wrap(err, "failed to save progress")
-							}
-							return errors.Wrap(err, "error verifying sha256 for attachment")
-						}
-						calculatedHash := strings.Fields(string(output))[0]
-						if calculatedHash != attachment.Sha {
-							err := errors.Errorf("SHA256 mismatch for attachment %s: %s != %s", attachment.Name, calculatedHash, attachment.Sha)
-							progress.FailedReleases[release.Id] = err.Error()
-							progress.LastFailedRelease = release.Id
-							if err := saveProgress(progress); err != nil {
-								return errors.Wrap(err, "failed to save progress")
-							}
-							return err
-						}
-
-						// Pin to IPFS cluster
-						cid, err := shared.PinFile(ipfsClusterClient, filePath)
-						if err != nil {
-							progress.FailedReleases[release.Id] = err.Error()
-							progress.LastFailedRelease = release.Id
-							if err := saveProgress(progress); err != nil {
-								return errors.Wrap(err, "failed to save progress")
-							}
-							return errors.Wrap(err, "error pinning attachment")
-						}
-
-						// Pin to Pinata if enabled
-						if pinataClient != nil {
-							name := fmt.Sprintf("release-%d-%s-%s-%s", release.RepositoryId, release.TagName, attachment.Name, attachment.Sha)
-							resp, err := pinataClient.PinFile(ctx, filePath, name)
-							if err != nil {
-								fmt.Printf("Warning: failed to pin release asset to Pinata for repo %d, tag %s, asset %s: %v\n", release.RepositoryId, release.TagName, attachment.Name, err)
-							} else {
-								fmt.Printf("Successfully pinned release asset to Pinata for repository %d, tag %s, asset %s (Pinata ID: %s)\n", release.RepositoryId, release.TagName, attachment.Name, resp.Data.ID)
-							}
-						}
-
-						// Compute merkle root and file info
-						rootHash, size, err := shared.ComputeFileInfo(filePath, cid)
-						if err != nil {
-							progress.FailedReleases[release.Id] = err.Error()
-							progress.LastFailedRelease = release.Id
-							if err := saveProgress(progress); err != nil {
-								return errors.Wrap(err, "failed to save progress")
-							}
-							return errors.Wrapf(err, "error computing file info for attachment %s", attachment.Name)
-						}
-
-						// Store release asset information
-						assetInfo := &shared.ReleaseAssetInfo{
-							RepositoryID: release.RepositoryId,
-							TagName:      release.TagName,
-							Name:         attachment.Name,
-							CID:          cid,
-							RootHash:     rootHash,
-							Size:         size,
-							SHA256:       attachment.Sha,
-							UpdatedAt:    time.Now(),
-							UpdatedBy:    "clone",
-						}
-						storageManager.SetReleaseAssetInfo(assetInfo)
-
-						fmt.Printf("Successfully downloaded and pinned attachment %s for release %s (CID: %s)\n", attachment.Name, release.TagName, cid)
-
-						// Delete the attachment file after successful pinning
-						if err := os.Remove(filePath); err != nil {
-							fmt.Printf("Warning: failed to delete attachment file %s: %v\n", filePath, err)
+							fmt.Printf("Warning: failed to pin release asset to Pinata for repo %d, tag %s, asset %s: %v\n", release.RepositoryId, release.TagName, attachment.Name, err)
 						} else {
-							fmt.Printf("Successfully deleted attachment file %s\n", filePath)
+							fmt.Printf("Successfully pinned release asset to Pinata for repository %d, tag %s, asset %s (Pinata ID: %s)\n", release.RepositoryId, release.TagName, attachment.Name, resp.Data.ID)
 						}
 					}
 
-					// Mark release as successfully processed
-					delete(progress.FailedReleases, release.Id)
-					progress.ProcessedReleases[release.Id] = true
-					progress.LastProcessedReleaseID = release.Id
-					progress.ReleaseNextKey = nextKey
-					if err := saveProgress(progress); err != nil {
-						return errors.Wrap(err, "failed to save progress")
+					// Compute merkle root and file info
+					rootHash, size, err := shared.ComputeFileInfo(filePath, cid)
+					if err != nil {
+						progress.FailedReleases[release.Id] = err.Error()
+						progress.LastFailedRelease = release.Id
+						if err := saveProgress(progress); err != nil {
+							return errors.Wrap(err, "failed to save progress")
+						}
+						return errors.Wrapf(err, "error computing file info for attachment %s", attachment.Name)
 					}
 
-					// Save storage manager state
-					if err := storageManager.Save(); err != nil {
-						return errors.Wrap(err, "failed to save storage manager")
+					// Store release asset information
+					assetInfo := &shared.ReleaseAssetInfo{
+						RepositoryID: release.RepositoryId,
+						TagName:      release.TagName,
+						Name:         attachment.Name,
+						CID:          cid,
+						RootHash:     rootHash,
+						Size:         size,
+						SHA256:       attachment.Sha,
+						UpdatedAt:    time.Now(),
+						UpdatedBy:    "clone",
 					}
+					storageManager.SetReleaseAssetInfo(assetInfo)
 
-					processedCount++
+					fmt.Printf("Successfully downloaded and pinned attachment %s for release %s (CID: %s)\n", attachment.Name, release.TagName, cid)
+
+					// Delete the attachment file after successful pinning
+					if err := os.Remove(filePath); err != nil {
+						fmt.Printf("Warning: failed to delete attachment file %s: %v\n", filePath, err)
+					} else {
+						fmt.Printf("Successfully deleted attachment file %s\n", filePath)
+					}
 				}
 
-				if releases.Pagination == nil || len(releases.Pagination.NextKey) == 0 {
-					fmt.Printf("Release processing complete - no more pages\n")
-					break
+				// Mark release as successfully processed
+				delete(progress.FailedReleases, release.Id)
+				progress.ProcessedReleases[release.Id] = true
+				progress.LastProcessedReleaseID = release.Id
+				if err := saveProgress(progress); err != nil {
+					return errors.Wrap(err, "failed to save progress")
 				}
-				nextKey = releases.Pagination.NextKey
-				fmt.Printf("Moving to next release page with key: %x\n", nextKey)
+
+				// Save storage manager state
+				if err := storageManager.Save(); err != nil {
+					return errors.Wrap(err, "failed to save storage manager")
+				}
+
+				processedCount++
 			}
+
+			fmt.Printf("Release processing complete - processed %d releases\n", processedCount)
 
 			fmt.Println("Clone script completed successfully!")
 			return nil
