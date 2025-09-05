@@ -43,7 +43,6 @@ type CloneProgress struct {
 	LastFailedRelease      uint64            `json:"last_failed_release"`
 	LastProcessedRepoID    uint64            `json:"last_processed_repo_id"`
 	LastProcessedReleaseID uint64            `json:"last_processed_release_id"`
-	ProcessedRepos         map[uint64]bool   `json:"processed_repos"`
 	ProcessedReleases      map[uint64]bool   `json:"processed_releases"`
 	CurrentBatchRepos      []uint64          `json:"current_batch_repos"`
 	CurrentBatchReleases   []uint64          `json:"current_batch_releases"`
@@ -54,7 +53,6 @@ func loadProgress() (*CloneProgress, error) {
 		return &CloneProgress{
 			FailedRepos:       make(map[uint64]string),
 			FailedReleases:    make(map[uint64]string),
-			ProcessedRepos:    make(map[uint64]bool),
 			ProcessedReleases: make(map[uint64]bool),
 		}, nil
 	}
@@ -75,9 +73,6 @@ func loadProgress() (*CloneProgress, error) {
 	if progress.FailedReleases == nil {
 		progress.FailedReleases = make(map[uint64]string)
 	}
-	if progress.ProcessedRepos == nil {
-		progress.ProcessedRepos = make(map[uint64]bool)
-	}
 	if progress.ProcessedReleases == nil {
 		progress.ProcessedReleases = make(map[uint64]bool)
 	}
@@ -95,11 +90,6 @@ func saveProgress(progress *CloneProgress) error {
 
 // Helper function to check if a repository should be processed
 func shouldProcessRepo(progress *CloneProgress, repoID uint64) bool {
-	// Skip if already processed successfully
-	if progress.ProcessedRepos[repoID] {
-		return false
-	}
-
 	// Process if it's a failed repo (retry)
 	if _, isFailed := progress.FailedRepos[repoID]; isFailed {
 		return true
@@ -620,7 +610,6 @@ func main() {
 
 				// Mark repository as successfully processed
 				delete(progress.FailedRepos, repository.Id)
-				progress.ProcessedRepos[repository.Id] = true
 				progress.LastProcessedRepoID = repository.Id
 				if err := saveProgress(progress); err != nil {
 					return errors.Wrap(err, "failed to save progress")
