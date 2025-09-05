@@ -7,7 +7,7 @@ toolchain go1.23.2
 require (
 	github.com/cosmos/cosmos-sdk v0.47.13
 	github.com/gitopia/gitopia-go v0.7.0
-	github.com/gitopia/gitopia-migration-tools/shared v0.0.2
+	github.com/gitopia/gitopia-migration-tools/shared v0.0.3
 	github.com/gitopia/gitopia/v6 v6.0.0
 	github.com/pkg/errors v0.9.1
 	github.com/spf13/cobra v1.8.0
