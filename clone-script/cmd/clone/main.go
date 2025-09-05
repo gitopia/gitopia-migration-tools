@@ -876,13 +876,6 @@ func main() {
 
 					fmt.Printf("Successfully downloaded and pinned attachment %s for release %s (CID: %s)\n", attachment.Name, release.TagName, cid)
 
-					// Delete the attachment file after successful pinning
-					if err := os.Remove(filePath); err != nil {
-						fmt.Printf("Warning: failed to delete attachment file %s: %v\n", filePath, err)
-					} else {
-						fmt.Printf("Successfully deleted attachment file %s\n", filePath)
-					}
-
 					// Save progress after each attachment to prevent data loss
 					fmt.Printf("Saving storage state after processing attachment %s\n", attachment.Name)
 					if err := storageManager.Save(); err != nil {
