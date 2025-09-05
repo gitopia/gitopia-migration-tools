@@ -138,8 +138,8 @@ func cloneForkWithAlternates(ctx context.Context, remoteUrl, repoDir, parentRepo
 	defer cancel()
 
 	initCmd := exec.CommandContext(initCtx, "git", "init", "--bare", repoDir)
-	if err := initCmd.Run(); err != nil {
-		return errors.Wrap(err, "failed to initialize bare repository")
+	if output, err := initCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to initialize bare repository: %s", string(output))
 	}
 
 	// Set up alternates file BEFORE adding remote and fetching
@@ -161,18 +161,18 @@ func cloneForkWithAlternates(ctx context.Context, remoteUrl, repoDir, parentRepo
 
 	addRemoteCmd := exec.CommandContext(addRemoteCtx, "git", "remote", "add", "origin", remoteUrl)
 	addRemoteCmd.Dir = repoDir
-	if err := addRemoteCmd.Run(); err != nil {
-		return errors.Wrap(err, "failed to add remote origin")
+	if output, err := addRemoteCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to add remote origin: %s", string(output))
 	}
 
 	// Fetch all refs with alternates optimization (should only fetch new objects)
 	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
-	fetchCmd := exec.CommandContext(fetchCtx, "git", "fetch", "origin", "--mirror")
+	fetchCmd := exec.CommandContext(fetchCtx, "git", "fetch", "origin", "+refs/*:refs/*")
 	fetchCmd.Dir = repoDir
-	if err := fetchCmd.Run(); err != nil {
-		return errors.Wrap(err, "failed to fetch from origin with alternates")
+	if output, err := fetchCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to fetch from origin with alternates: %s", string(output))
 	}
 
 	fmt.Printf("Successfully cloned fork with alternates optimization - only fetched unique objects\n")
@@ -241,8 +241,8 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		defer cancel()
 
 		cmd := exec.CommandContext(cloneCtx, "git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
-		if err := cmd.Run(); err != nil {
-			return errors.Wrapf(err, "error cloning repository %d", repoID)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "error cloning repository %d: %s", repoID, string(output))
 		}
 	}
 
@@ -252,8 +252,8 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 
 	gcCmd := exec.CommandContext(gcCtx, "git", "gc")
 	gcCmd.Dir = repoDir
-	if err := gcCmd.Run(); err != nil {
-		return errors.Wrapf(err, "error running git gc for repo %d", repoID)
+	if output, err := gcCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "error running git gc for repo %d: %s", repoID, string(output))
 	}
 
 	// For forked repos with alternates, run git repack to remove common objects
@@ -268,8 +268,8 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 
 			repackCmd := exec.CommandContext(repackCtx, "git", "repack", "-a", "-d", "-l")
 			repackCmd.Dir = repoDir
-			if err := repackCmd.Run(); err != nil {
-				fmt.Printf("Warning: git repack failed for forked repo %d: %v\n", repoID, err)
+			if output, err := repackCmd.CombinedOutput(); err != nil {
+				fmt.Printf("Warning: git repack failed for forked repo %d: %v\nOutput: %s\n", repoID, err, string(output))
 			}
 		}
 	}
@@ -378,8 +378,8 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 		defer cancel()
 
 		cmd := exec.CommandContext(initCtx, "git", "init", "--bare", parentRepoDir)
-		if err := cmd.Run(); err != nil {
-			return errors.Wrapf(err, "failed to initialize parent repository %d", parentRepoID)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "failed to initialize parent repository %d: %s", parentRepoID, string(output))
 		}
 	}
 
@@ -417,8 +417,8 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 
 	cmd := exec.CommandContext(parentGcCtx, "git", "gc")
 	cmd.Dir = parentRepoDir
-	if err := cmd.Run(); err != nil {
-		return errors.Wrapf(err, "error running git gc for parent repo %d", parentRepoID)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "error running git gc for parent repo %d: %s", parentRepoID, string(output))
 	}
 
 	// Parent packfile is already stored in IPFS cluster, no need to pin again
@@ -446,8 +446,8 @@ func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
 
 	cmd := exec.CommandContext(indexCtx, "git", "index-pack", packfilePath)
 	cmd.Dir = repoDir
-	if err := cmd.Run(); err != nil {
-		return errors.Wrap(err, "failed to build pack index")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to build pack index: %s", string(output))
 	}
 
 	return nil
