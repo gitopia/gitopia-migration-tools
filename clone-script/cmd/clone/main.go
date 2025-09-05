@@ -166,15 +166,12 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	}
 
 	// Check if repository is empty
-	branch, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+	_, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
 		Id:             repository.Owner.Id,
 		RepositoryName: repository.Name,
 		BranchName:     repository.DefaultBranch,
 	})
 	if err != nil {
-		return errors.Wrapf(err, "error getting repository branches for repo %d", repoID)
-	}
-	if branch.Branch.Name == "" {
 		fmt.Printf("Repository %d is empty, skipping\n", repoID)
 		return nil
 	}
