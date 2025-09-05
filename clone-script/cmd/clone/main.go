@@ -125,22 +125,6 @@ func shouldProcessRelease(progress *CloneProgress, releaseID uint64) bool {
 	return releaseID > progress.LastProcessedReleaseID
 }
 
-// Helper function to validate fork repository dependencies
-func validateForkDependency(progress *CloneProgress, repository *gitopiatypes.Repository, gitDir string) error {
-	if !repository.Fork {
-		return nil
-	}
-
-	parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
-	if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
-		// Check if parent is in current batch or already processed
-		if !progress.ProcessedRepos[repository.Parent] {
-			return errors.Errorf("parent repository %d not found and not processed yet for fork %d", repository.Parent, repository.Id)
-		}
-	}
-	return nil
-}
-
 // Atomic operation for repository processing
 func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repository, gitDir string,
 	ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager,
@@ -621,13 +605,6 @@ func main() {
 				}
 
 				repository := repositoryResp.Repository
-
-				// Validate fork dependencies
-				if err := validateForkDependency(progress, repository, gitDir); err != nil {
-					fmt.Printf("Skipping fork repository %d due to dependency issue: %v\n", repository.Id, err)
-					processedCount++
-					continue
-				}
 
 				fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
 
