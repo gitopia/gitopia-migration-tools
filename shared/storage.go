@@ -2,6 +2,7 @@ package shared
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +12,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 )
-
 
 // PackfileInfo stores information about a repository's packfile
 type PackfileInfo struct {
@@ -48,12 +48,11 @@ type ReleaseAssetInfo struct {
 	UpdatedBy    string    `json:"updated_by"` // "clone" or "sync"
 }
 
-
 // StorageManager manages persistent storage of migration data using SQLite
 type StorageManager struct {
-	mu       sync.RWMutex
-	db       *sql.DB
-	dbPath   string
+	mu     sync.RWMutex
+	db     *sql.DB
+	dbPath string
 }
 
 // NewStorageManager creates a new storage manager with SQLite backend
@@ -96,6 +95,7 @@ func (sm *StorageManager) createTables() error {
 	_, err := sm.db.Exec(`
 		CREATE TABLE IF NOT EXISTS packfiles (
 			repository_id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
 			cid TEXT NOT NULL,
 			root_hash TEXT NOT NULL,
 			size INTEGER NOT NULL,
@@ -190,14 +190,17 @@ func (sm *StorageManager) SetPackfileInfo(info *PackfileInfo) {
 
 	// Check if we should update based on precedence
 	var existing *PackfileInfo
-	row := sm.db.QueryRow("SELECT cid, root_hash, size, updated_at, updated_by FROM packfiles WHERE repository_id = ?", info.RepositoryID)
-	var cid, rootHashHex, updatedBy string
+	row := sm.db.QueryRow("SELECT name, cid, root_hash, size, updated_at, updated_by FROM packfiles WHERE repository_id = ?", info.RepositoryID)
+	var name, cid, rootHashHex, updatedBy string
 	var size int64
 	var updatedAt time.Time
-	if err := row.Scan(&cid, &rootHashHex, &size, &updatedAt, &updatedBy); err == nil {
+	if err := row.Scan(&name, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err == nil {
+		rootHash, _ := hex.DecodeString(rootHashHex)
 		existing = &PackfileInfo{
 			RepositoryID: info.RepositoryID,
+			Name:         name,
 			CID:          cid,
+			RootHash:     rootHash,
 			Size:         size,
 			UpdatedAt:    updatedAt,
 			UpdatedBy:    updatedBy,
@@ -207,9 +210,9 @@ func (sm *StorageManager) SetPackfileInfo(info *PackfileInfo) {
 	if existing == nil || shouldUpdate(existing.UpdatedBy, existing.UpdatedAt, info.UpdatedBy, info.UpdatedAt) {
 		_, err := sm.db.Exec(`
 			INSERT OR REPLACE INTO packfiles 
-			(repository_id, cid, root_hash, size, updated_at, updated_by) 
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, info.RepositoryID, info.CID, fmt.Sprintf("%x", info.RootHash), info.Size, info.UpdatedAt, info.UpdatedBy)
+			(repository_id, name, cid, root_hash, size, updated_at, updated_by) 
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, info.RepositoryID, info.Name, info.CID, hex.EncodeToString(info.RootHash), info.Size, info.UpdatedAt, info.UpdatedBy)
 		if err != nil {
 			// Log error but don't fail the operation
 			fmt.Printf("Error storing packfile info: %v\n", err)
@@ -222,22 +225,23 @@ func (sm *StorageManager) GetPackfileInfo(repositoryID uint64) *PackfileInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	row := sm.db.QueryRow("SELECT cid, root_hash, size, updated_at, updated_by FROM packfiles WHERE repository_id = ?", repositoryID)
-	var cid, rootHashHex, updatedBy string
+	row := sm.db.QueryRow("SELECT name, cid, root_hash, size, updated_at, updated_by FROM packfiles WHERE repository_id = ?", repositoryID)
+	var name, cid, rootHashHex, updatedBy string
 	var size int64
 	var updatedAt time.Time
-	if err := row.Scan(&cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
+	if err := row.Scan(&name, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
 		return nil
 	}
 
 	// Convert hex string back to bytes
-	rootHash := make([]byte, len(rootHashHex)/2)
-	for i := 0; i < len(rootHash); i++ {
-		fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+	rootHash, err := hex.DecodeString(rootHashHex)
+	if err != nil {
+		return nil
 	}
 
 	return &PackfileInfo{
 		RepositoryID: repositoryID,
+		Name:         name,
 		CID:          cid,
 		RootHash:     rootHash,
 		Size:         size,
@@ -258,10 +262,12 @@ func (sm *StorageManager) SetLFSObjectInfo(info *LFSObjectInfo) {
 	var size int64
 	var updatedAt time.Time
 	if err := row.Scan(&cid, &rootHashHex, &size, &updatedAt, &updatedBy); err == nil {
+		rootHash, _ := hex.DecodeString(rootHashHex)
 		existing = &LFSObjectInfo{
 			RepositoryID: info.RepositoryID,
 			OID:          info.OID,
 			CID:          cid,
+			RootHash:     rootHash,
 			Size:         size,
 			UpdatedAt:    updatedAt,
 			UpdatedBy:    updatedBy,
@@ -273,7 +279,7 @@ func (sm *StorageManager) SetLFSObjectInfo(info *LFSObjectInfo) {
 			INSERT OR REPLACE INTO lfs_objects 
 			(repository_id, oid, cid, root_hash, size, updated_at, updated_by) 
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, info.RepositoryID, info.OID, info.CID, fmt.Sprintf("%x", info.RootHash), info.Size, info.UpdatedAt, info.UpdatedBy)
+		`, info.RepositoryID, info.OID, info.CID, hex.EncodeToString(info.RootHash), info.Size, info.UpdatedAt, info.UpdatedBy)
 		if err != nil {
 			// Log error but don't fail the operation
 			fmt.Printf("Error storing LFS object info: %v\n", err)
@@ -295,9 +301,9 @@ func (sm *StorageManager) GetLFSObjectInfo(repositoryID uint64, oid string) *LFS
 	}
 
 	// Convert hex string back to bytes
-	rootHash := make([]byte, len(rootHashHex)/2)
-	for i := 0; i < len(rootHash); i++ {
-		fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+	rootHash, err := hex.DecodeString(rootHashHex)
+	if err != nil {
+		return nil
 	}
 
 	return &LFSObjectInfo{
@@ -323,11 +329,13 @@ func (sm *StorageManager) SetReleaseAssetInfo(info *ReleaseAssetInfo) {
 	var size int64
 	var updatedAt time.Time
 	if err := row.Scan(&cid, &rootHashHex, &size, &sha256, &updatedAt, &updatedBy); err == nil {
+		rootHash, _ := hex.DecodeString(rootHashHex)
 		existing = &ReleaseAssetInfo{
 			RepositoryID: info.RepositoryID,
 			TagName:      info.TagName,
 			Name:         info.Name,
 			CID:          cid,
+			RootHash:     rootHash,
 			Size:         size,
 			SHA256:       sha256,
 			UpdatedAt:    updatedAt,
@@ -340,7 +348,7 @@ func (sm *StorageManager) SetReleaseAssetInfo(info *ReleaseAssetInfo) {
 			INSERT OR REPLACE INTO release_assets 
 			(repository_id, tag_name, name, cid, root_hash, size, sha256, updated_at, updated_by) 
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, info.RepositoryID, info.TagName, info.Name, info.CID, fmt.Sprintf("%x", info.RootHash), info.Size, info.SHA256, info.UpdatedAt, info.UpdatedBy)
+		`, info.RepositoryID, info.TagName, info.Name, info.CID, hex.EncodeToString(info.RootHash), info.Size, info.SHA256, info.UpdatedAt, info.UpdatedBy)
 		if err != nil {
 			// Log error but don't fail the operation
 			fmt.Printf("Error storing release asset info: %v\n", err)
@@ -362,9 +370,9 @@ func (sm *StorageManager) GetReleaseAssetInfo(repositoryID uint64, tagName, asse
 	}
 
 	// Convert hex string back to bytes
-	rootHash := make([]byte, len(rootHashHex)/2)
-	for i := 0; i < len(rootHash); i++ {
-		fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+	rootHash, err := hex.DecodeString(rootHashHex)
+	if err != nil {
+		return nil
 	}
 
 	return &ReleaseAssetInfo{
@@ -385,7 +393,7 @@ func (sm *StorageManager) GetAllPackfileInfo() []*PackfileInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	rows, err := sm.db.Query("SELECT repository_id, cid, root_hash, size, updated_at, updated_by FROM packfiles")
+	rows, err := sm.db.Query("SELECT repository_id, name, cid, root_hash, size, updated_at, updated_by FROM packfiles")
 	if err != nil {
 		return nil
 	}
@@ -394,21 +402,22 @@ func (sm *StorageManager) GetAllPackfileInfo() []*PackfileInfo {
 	var result []*PackfileInfo
 	for rows.Next() {
 		var repositoryID uint64
-		var cid, rootHashHex, updatedBy string
+		var name, cid, rootHashHex, updatedBy string
 		var size int64
 		var updatedAt time.Time
-		if err := rows.Scan(&repositoryID, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
+		if err := rows.Scan(&repositoryID, &name, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
 			continue
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result = append(result, &PackfileInfo{
 			RepositoryID: repositoryID,
+			Name:         name,
 			CID:          cid,
 			RootHash:     rootHash,
 			Size:         size,
@@ -441,9 +450,9 @@ func (sm *StorageManager) GetAllLFSObjects() []*LFSObjectInfo {
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result = append(result, &LFSObjectInfo{
@@ -481,9 +490,9 @@ func (sm *StorageManager) GetAllReleaseAssets() map[string]*ReleaseAssetInfo {
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result[fmt.Sprintf("%d:%s:%s", repositoryID, tagName, name)] = &ReleaseAssetInfo{
@@ -522,9 +531,9 @@ func (sm *StorageManager) GetLFSObjectsByRepository(repositoryID uint64) []*LFSO
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result = append(result, &LFSObjectInfo{
@@ -561,9 +570,9 @@ func (sm *StorageManager) GetReleaseAssetsByRepository(repositoryID uint64) []*R
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result = append(result, &ReleaseAssetInfo{
@@ -602,9 +611,9 @@ func (sm *StorageManager) GetReleaseAssetsByRepositoryAndTag(repositoryID uint64
 		}
 
 		// Convert hex string back to bytes
-		rootHash := make([]byte, len(rootHashHex)/2)
-		for i := 0; i < len(rootHash); i++ {
-			fmt.Sscanf(rootHashHex[i*2:i*2+2], "%02x", &rootHash[i])
+		rootHash, err := hex.DecodeString(rootHashHex)
+		if err != nil {
+			continue
 		}
 
 		result = append(result, &ReleaseAssetInfo{
