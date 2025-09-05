@@ -740,12 +740,15 @@ func main() {
 				fmt.Printf("Processing release %s for repository %d (%d/%d)\n", release.TagName, release.RepositoryId, processedCount+1, totalReleases)
 
 				if len(release.Attachments) == 0 {
+					fmt.Printf("Release %s has no attachments, marking as processed\n", release.TagName)
 					// Mark release as processed even if no attachments
 					progress.ProcessedReleases[release.Id] = true
 					progress.LastProcessedReleaseID = release.Id
 					processedCount++
 					continue
 				}
+
+				fmt.Printf("Release %s has %d attachments to process\n", release.TagName, len(release.Attachments))
 
 				// Fetch repository
 				repository, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
@@ -760,7 +763,8 @@ func main() {
 					return errors.Wrap(err, "error getting repository")
 				}
 
-				for _, attachment := range release.Attachments {
+				for i, attachment := range release.Attachments {
+					fmt.Printf("Processing attachment %d/%d: %s\n", i+1, len(release.Attachments), attachment.Name)
 					// Check if release asset already exists in database (might be processed by sync daemon)
 					existingAsset := storageManager.GetReleaseAssetInfo(release.RepositoryId, release.TagName, attachment.Name)
 					if existingAsset != nil && existingAsset.UpdatedBy == "sync" {
@@ -873,6 +877,16 @@ func main() {
 					} else {
 						fmt.Printf("Successfully deleted attachment file %s\n", filePath)
 					}
+
+					// Save progress after each attachment to prevent data loss
+					fmt.Printf("Saving progress after processing attachment %s\n", attachment.Name)
+					if err := saveProgress(progress, releasesOnly); err != nil {
+						fmt.Printf("Warning: failed to save progress after attachment: %v\n", err)
+					}
+					if err := storageManager.Save(); err != nil {
+						fmt.Printf("Warning: failed to save storage manager after attachment: %v\n", err)
+					}
+					fmt.Printf("Completed processing attachment %s for release %s\n", attachment.Name, release.TagName)
 				}
 
 				// Mark release as successfully processed
