@@ -54,7 +54,7 @@ func loadProgress(releasesOnly bool) (*CloneProgress, error) {
 	if releasesOnly {
 		progressFile = ReleaseProgressFile
 	}
-	
+
 	if _, err := os.Stat(progressFile); os.IsNotExist(err) {
 		return &CloneProgress{
 			FailedRepos:       make(map[uint64]string),
@@ -91,7 +91,7 @@ func saveProgress(progress *CloneProgress, releasesOnly bool) error {
 	if releasesOnly {
 		progressFile = ReleaseProgressFile
 	}
-	
+
 	data, err := json.Marshal(progress)
 	if err != nil {
 		return errors.Wrap(err, "failed to marshal progress")
@@ -124,6 +124,59 @@ func shouldProcessRelease(progress *CloneProgress, releaseID uint64) bool {
 
 	// Process if it's a new release (ID > last processed)
 	return releaseID > progress.LastProcessedReleaseID
+}
+
+// cloneForkWithAlternates performs an optimized clone of a forked repository using Git alternates
+func cloneForkWithAlternates(ctx context.Context, remoteUrl, repoDir, parentRepoDir string, parentRepoID uint64) error {
+	// Create the repository directory structure
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		return errors.Wrap(err, "failed to create repository directory")
+	}
+
+	// Initialize bare repository
+	initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	initCmd := exec.CommandContext(initCtx, "git", "init", "--bare", repoDir)
+	if err := initCmd.Run(); err != nil {
+		return errors.Wrap(err, "failed to initialize bare repository")
+	}
+
+	// Set up alternates file BEFORE adding remote and fetching
+	if _, err := os.Stat(parentRepoDir); err == nil {
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+			return errors.Wrap(err, "failed to create alternates directory")
+		}
+		parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+		if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+			return errors.Wrap(err, "failed to create alternates file")
+		}
+		fmt.Printf("Created alternates file linking to parent repository %d before fetching\n", parentRepoID)
+	}
+
+	// Add remote origin
+	addRemoteCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	addRemoteCmd := exec.CommandContext(addRemoteCtx, "git", "remote", "add", "origin", remoteUrl)
+	addRemoteCmd.Dir = repoDir
+	if err := addRemoteCmd.Run(); err != nil {
+		return errors.Wrap(err, "failed to add remote origin")
+	}
+
+	// Fetch all refs with alternates optimization (should only fetch new objects)
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	fetchCmd := exec.CommandContext(fetchCtx, "git", "fetch", "origin", "--mirror")
+	fetchCmd.Dir = repoDir
+	if err := fetchCmd.Run(); err != nil {
+		return errors.Wrap(err, "failed to fetch from origin with alternates")
+	}
+
+	fmt.Printf("Successfully cloned fork with alternates optimization - only fetched unique objects\n")
+	return nil
 }
 
 // Atomic operation for repository processing
@@ -160,22 +213,13 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		return nil
 	}
 
-	// Clone repository
+	// Clone repository with optimized fork handling
 	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
 	remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Owner.Id, repository.Name)
-	
-	// Create context with timeout for git clone (30 minutes)
-	cloneCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-	defer cancel()
-	
-	cmd := exec.CommandContext(cloneCtx, "git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
-	if err := cmd.Run(); err != nil {
-		return errors.Wrapf(err, "error cloning repository %d", repoID)
-	}
 
-	// Handle forked repository optimization
+	// Handle forked repository optimization - set up alternates BEFORE cloning
 	if repository.Fork {
-		fmt.Printf("Repository %d is a fork of %d, setting up alternates\n", repoID, repository.Parent)
+		fmt.Printf("Repository %d is a fork of %d, setting up optimized clone with alternates\n", repoID, repository.Parent)
 
 		// Ensure parent repository is processed first
 		parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
@@ -186,26 +230,29 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 			}
 		}
 
-		if _, err := os.Stat(parentRepoDir); err == nil {
-			alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
-			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
-				return errors.Wrapf(err, "error creating alternates directory for repo %d", repoID)
-			}
-			parentObjectsPath := filepath.Join(parentRepoDir, "objects")
-			if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
-				return errors.Wrapf(err, "error creating alternates file for repo %d", repoID)
-			}
-			fmt.Printf("Created alternates file linking to parent repository %d\n", repository.Parent)
+		// Clone fork with alternates optimization
+		if err := cloneForkWithAlternates(ctx, remoteUrl, repoDir, parentRepoDir, repository.Parent); err != nil {
+			return errors.Wrapf(err, "error cloning forked repository %d with alternates", repoID)
+		}
+	} else {
+		// Standard clone for non-forked repositories
+		// Create context with timeout for git clone (30 minutes)
+		cloneCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+
+		cmd := exec.CommandContext(cloneCtx, "git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
+		if err := cmd.Run(); err != nil {
+			return errors.Wrapf(err, "error cloning repository %d", repoID)
 		}
 	}
 
 	// Run git gc with timeout (10 minutes)
 	gcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	
-	cmd = exec.CommandContext(gcCtx, "git", "gc")
-	cmd.Dir = repoDir
-	if err := cmd.Run(); err != nil {
+
+	gcCmd := exec.CommandContext(gcCtx, "git", "gc")
+	gcCmd.Dir = repoDir
+	if err := gcCmd.Run(); err != nil {
 		return errors.Wrapf(err, "error running git gc for repo %d", repoID)
 	}
 
@@ -214,14 +261,14 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
 		if _, err := os.Stat(alternatesPath); err == nil {
 			fmt.Printf("Running git repack to optimize forked repository %d\n", repoID)
-			
+
 			// Create context with timeout for git repack (15 minutes)
 			repackCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 			defer cancel()
-			
-			cmd = exec.CommandContext(repackCtx, "git", "repack", "-a", "-d", "-l")
-			cmd.Dir = repoDir
-			if err := cmd.Run(); err != nil {
+
+			repackCmd := exec.CommandContext(repackCtx, "git", "repack", "-a", "-d", "-l")
+			repackCmd.Dir = repoDir
+			if err := repackCmd.Run(); err != nil {
 				fmt.Printf("Warning: git repack failed for forked repo %d: %v\n", repoID, err)
 			}
 		}
@@ -326,10 +373,10 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 	// Initialize parent repository directory
 	parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", parentRepoID))
 	if _, err := os.Stat(filepath.Join(parentRepoDir, "objects")); os.IsNotExist(err) {
-			// Create context with timeout for git init (5 minutes)
+		// Create context with timeout for git init (5 minutes)
 		initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
-		
+
 		cmd := exec.CommandContext(initCtx, "git", "init", "--bare", parentRepoDir)
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "failed to initialize parent repository %d", parentRepoID)
@@ -367,7 +414,7 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 	// Run git gc on parent repository with timeout (10 minutes)
 	parentGcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	
+
 	cmd := exec.CommandContext(parentGcCtx, "git", "gc")
 	cmd.Dir = parentRepoDir
 	if err := cmd.Run(); err != nil {
@@ -396,7 +443,7 @@ func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
 	// Build pack index file with timeout (10 minutes)
 	indexCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	
+
 	cmd := exec.CommandContext(indexCtx, "git", "index-pack", packfilePath)
 	cmd.Dir = repoDir
 	if err := cmd.Run(); err != nil {
@@ -730,11 +777,11 @@ func main() {
 						attachment.Name)
 
 					filePath := filepath.Join(attachmentDir, attachment.Sha)
-					
+
 					// Create context with timeout for wget (20 minutes)
 					wgetCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 					defer cancel()
-					
+
 					cmd := exec.CommandContext(wgetCtx, "wget", attachmentUrl, "-O", filePath)
 					output, err := cmd.CombinedOutput()
 					if err != nil {
@@ -749,7 +796,7 @@ func main() {
 					// Verify sha256 with timeout (5 minutes)
 					shaCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 					defer cancel()
-					
+
 					cmd = exec.CommandContext(shaCtx, "sha256sum", filePath)
 					output, err = cmd.CombinedOutput()
 					if err != nil {
