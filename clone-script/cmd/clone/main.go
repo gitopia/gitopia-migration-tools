@@ -596,8 +596,10 @@ func main() {
 			var processedCount int
 			var totalRepositories uint64
 			nextKey := progress.RepositoryNextKey
+			fmt.Printf("Starting repository processing with next key: %x\n", nextKey)
 
 			for {
+				fmt.Printf("Querying repositories with next key: %x\n", nextKey)
 				repositories, err := gitopiaClient.QueryClient().Gitopia.RepositoryAll(ctx, &gitopiatypes.QueryAllRepositoryRequest{
 					Pagination: &query.PageRequest{
 						Key: nextKey,
@@ -667,17 +669,21 @@ func main() {
 				}
 
 				if repositories.Pagination == nil || len(repositories.Pagination.NextKey) == 0 {
+					fmt.Printf("Repository processing complete - no more pages\n")
 					break
 				}
 				nextKey = repositories.Pagination.NextKey
+				fmt.Printf("Moving to next repository page with key: %x\n", nextKey)
 			}
 
 			// Process releases
 			processedCount = 0
 			var totalReleases uint64
 			nextKey = progress.ReleaseNextKey
+			fmt.Printf("Starting release processing with next key: %x\n", nextKey)
 
 			for {
+				fmt.Printf("Querying releases with next key: %x\n", nextKey)
 				releases, err := gitopiaClient.QueryClient().Gitopia.ReleaseAll(ctx, &gitopiatypes.QueryAllReleaseRequest{
 					Pagination: &query.PageRequest{
 						Key: nextKey,
@@ -857,9 +863,11 @@ func main() {
 				}
 
 				if releases.Pagination == nil || len(releases.Pagination.NextKey) == 0 {
+					fmt.Printf("Release processing complete - no more pages\n")
 					break
 				}
 				nextKey = releases.Pagination.NextKey
+				fmt.Printf("Moving to next release page with key: %x\n", nextKey)
 			}
 
 			fmt.Println("Clone script completed successfully!")
