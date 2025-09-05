@@ -602,6 +602,12 @@ func main() {
 				return errors.Wrap(err, "failed to get releases-only flag")
 			}
 
+			// Get the retry-failed flag
+			retryFailed, err := cmd.Flags().GetBool("retry-failed")
+			if err != nil {
+				return errors.Wrap(err, "failed to get retry-failed flag")
+			}
+
 			// Create required directories
 			gitDir := viper.GetString("GIT_REPOS_DIR")
 			if err := os.MkdirAll(gitDir, 0755); err != nil {
@@ -665,63 +671,116 @@ func main() {
 				// Process repositories using direct ID queries (0 to 62973)
 				var processedCount int
 				const maxRepositoryID uint64 = 62973
-				fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
 
-				// Determine starting ID based on progress
-				startID := uint64(0)
-				if progress.LastProcessedRepoID > 0 {
-					startID = progress.LastProcessedRepoID + 1
-				}
+				if retryFailed {
+					fmt.Printf("Starting retry of failed repositories from progress file\n")
+					fmt.Printf("Found %d failed repositories to retry\n", len(progress.FailedRepos))
 
-				for repoID := startID; repoID <= maxRepositoryID; repoID++ {
-					// Use improved resume logic
-					if !shouldProcessRepo(progress, repoID) {
-						processedCount++
-						continue
-					}
+					// Process only failed repositories
+					for repoID, failureReason := range progress.FailedRepos {
+						fmt.Printf("Retrying failed repository ID %d (previous failure: %s)\n", repoID, failureReason)
 
-					fmt.Printf("Querying repository ID %d\n", repoID)
-					repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
-						Id: repoID,
-					})
-					if err != nil {
-						// Repository might not exist, skip and continue
-						fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
-						processedCount++
-						continue
-					}
+						repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+							Id: repoID,
+						})
+						if err != nil {
+							// Repository might not exist, skip and continue
+							fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
+							delete(progress.FailedRepos, repoID) // Remove from failed repos since it doesn't exist
+							if err := saveProgress(progress, releasesOnly); err != nil {
+								return errors.Wrap(err, "failed to save progress")
+							}
+							continue
+						}
 
-					repository := repositoryResp.Repository
+						repository := repositoryResp.Repository
 
-					fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
+						fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, len(progress.FailedRepos))
 
-					// Use atomic processing function
-					if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
-						progress.FailedRepos[repository.Id] = err.Error()
-						progress.LastFailedRepo = repository.Id
+						// Use atomic processing function
+						if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
+							progress.FailedRepos[repository.Id] = err.Error()
+							if err := saveProgress(progress, releasesOnly); err != nil {
+								return errors.Wrap(err, "failed to save progress")
+							}
+							return errors.Wrapf(err, "error processing repository %d", repository.Id)
+						}
+
+						// Mark repository as successfully processed - remove from failed repos but don't update last processed ID
+						delete(progress.FailedRepos, repository.Id)
 						if err := saveProgress(progress, releasesOnly); err != nil {
 							return errors.Wrap(err, "failed to save progress")
 						}
-						return errors.Wrapf(err, "error processing repository %d", repository.Id)
+
+						// Save storage manager state
+						if err := storageManager.Save(); err != nil {
+							return errors.Wrap(err, "failed to save storage manager")
+						}
+
+						processedCount++
+						fmt.Printf("Successfully retried repository %d\n", repository.Id)
 					}
 
-					// Mark repository as successfully processed
-					delete(progress.FailedRepos, repository.Id)
-					progress.LastProcessedRepoID = repository.Id
-					if err := saveProgress(progress, releasesOnly); err != nil {
-						return errors.Wrap(err, "failed to save progress")
+					fmt.Printf("Retry processing complete - processed %d failed repositories\n", processedCount)
+				} else {
+					fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
+
+					// Determine starting ID based on progress
+					startID := uint64(0)
+					if progress.LastProcessedRepoID > 0 {
+						startID = progress.LastProcessedRepoID + 1
 					}
 
-					// Save storage manager state
-					if err := storageManager.Save(); err != nil {
-						return errors.Wrap(err, "failed to save storage manager")
+					for repoID := startID; repoID <= maxRepositoryID; repoID++ {
+						// Use improved resume logic
+						if !shouldProcessRepo(progress, repoID) {
+							processedCount++
+							continue
+						}
+
+						fmt.Printf("Querying repository ID %d\n", repoID)
+						repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+							Id: repoID,
+						})
+						if err != nil {
+							// Repository might not exist, skip and continue
+							fmt.Printf("Repository ID %d not found, skipping: %v\n", repoID, err)
+							processedCount++
+							continue
+						}
+
+						repository := repositoryResp.Repository
+
+						fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, maxRepositoryID+1)
+
+						// Use atomic processing function
+						if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
+							progress.FailedRepos[repository.Id] = err.Error()
+							progress.LastFailedRepo = repository.Id
+							if err := saveProgress(progress, releasesOnly); err != nil {
+								return errors.Wrap(err, "failed to save progress")
+							}
+							return errors.Wrapf(err, "error processing repository %d", repository.Id)
+						}
+
+						// Mark repository as successfully processed
+						delete(progress.FailedRepos, repository.Id)
+						progress.LastProcessedRepoID = repository.Id
+						if err := saveProgress(progress, releasesOnly); err != nil {
+							return errors.Wrap(err, "failed to save progress")
+						}
+
+						// Save storage manager state
+						if err := storageManager.Save(); err != nil {
+							return errors.Wrap(err, "failed to save storage manager")
+						}
+
+						processedCount++
+						fmt.Printf("Successfully cloned repository %d\n", repository.Id)
 					}
 
-					processedCount++
-					fmt.Printf("Successfully cloned repository %d\n", repository.Id)
+					fmt.Printf("Repository processing complete - processed all IDs from 0 to %d\n", maxRepositoryID)
 				}
-
-				fmt.Printf("Repository processing complete - processed all IDs from 0 to %d\n", maxRepositoryID)
 			} else {
 				fmt.Println("Skipping repository processing (releases-only mode)")
 			}
@@ -893,6 +952,7 @@ func main() {
 	rootCmd.Flags().String("from", "", "Name or address of private key with which to sign")
 	rootCmd.Flags().String("keyring-backend", "", "Select keyring's backend (os|file|kwallet|pass|test|memory)")
 	rootCmd.Flags().Bool("releases-only", false, "Process only releases, skip repository cloning")
+	rootCmd.Flags().Bool("retry-failed", false, "Retry only failed repositories from progress file")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
