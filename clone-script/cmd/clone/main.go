@@ -32,7 +32,6 @@ const (
 	AccountPubKeyPrefix  = AccountAddressPrefix + sdk.PrefixPublic
 	AppName              = "gitopia-clone-script"
 	ProgressFile         = "gitopia_clone_progress.json"
-	ReleaseProgressFile  = "gitopia_clone_releases_progress.json"
 )
 
 type CloneProgress struct {
@@ -52,7 +51,10 @@ type CloneProgress struct {
 func loadProgress(releasesOnly bool) (*CloneProgress, error) {
 	progressFile := ProgressFile
 	if releasesOnly {
-		progressFile = ReleaseProgressFile
+		// For releases, don't use separate progress file - infer from database
+		return &CloneProgress{
+			FailedRepos: make(map[uint64]string),
+		}, nil
 	}
 
 	if _, err := os.Stat(progressFile); os.IsNotExist(err) {
@@ -89,7 +91,8 @@ func loadProgress(releasesOnly bool) (*CloneProgress, error) {
 func saveProgress(progress *CloneProgress, releasesOnly bool) error {
 	progressFile := ProgressFile
 	if releasesOnly {
-		progressFile = ReleaseProgressFile
+		// For releases, don't save separate progress file - rely on database state
+		return nil
 	}
 
 	data, err := json.Marshal(progress)
@@ -111,19 +114,24 @@ func shouldProcessRepo(progress *CloneProgress, repoID uint64) bool {
 }
 
 // Helper function to check if a release should be processed
-func shouldProcessRelease(progress *CloneProgress, releaseID uint64) bool {
-	// Skip if already processed successfully
-	if progress.ProcessedReleases[releaseID] {
-		return false
-	}
-
-	// Process if it's a failed release (retry)
-	if _, isFailed := progress.FailedReleases[releaseID]; isFailed {
+func shouldProcessRelease(storageManager *shared.StorageManager, progress *CloneProgress, release *gitopiatypes.Release) bool {
+	// If release has no attachments, process it (new logic will handle this)
+	if len(release.Attachments) == 0 {
 		return true
 	}
 
-	// Process if it's a new release (ID > last processed)
-	return releaseID > progress.LastProcessedReleaseID
+	// Check if all attachments have been processed in the database
+	allProcessed := true
+	for _, attachment := range release.Attachments {
+		existingAsset := storageManager.GetReleaseAssetInfo(release.RepositoryId, release.TagName, attachment.Name)
+		if existingAsset == nil {
+			allProcessed = false
+			break
+		}
+	}
+
+	// If all attachments are processed, skip this release
+	return !allProcessed
 }
 
 // cloneForkWithAlternates performs an optimized clone of a forked repository using Git alternates
@@ -732,7 +740,7 @@ func main() {
 
 			for _, release := range releases.Release {
 				// Use improved resume logic
-				if !shouldProcessRelease(progress, release.Id) {
+				if !shouldProcessRelease(storageManager, progress, release) {
 					processedCount++
 					continue
 				}
@@ -741,9 +749,7 @@ func main() {
 
 				if len(release.Attachments) == 0 {
 					fmt.Printf("Release %s has no attachments, marking as processed\n", release.TagName)
-					// Mark release as processed even if no attachments
-					progress.ProcessedReleases[release.Id] = true
-					progress.LastProcessedReleaseID = release.Id
+					// Mark release as processed even if no attachments (using database state now)
 					processedCount++
 					continue
 				}
@@ -755,11 +761,7 @@ func main() {
 					Id: release.RepositoryId,
 				})
 				if err != nil {
-					progress.FailedReleases[release.Id] = err.Error()
-					progress.LastFailedRelease = release.Id
-					if err := saveProgress(progress, releasesOnly); err != nil {
-						return errors.Wrap(err, "failed to save progress")
-					}
+					fmt.Printf("Error getting repository for release %s: %v\n", release.TagName, err)
 					return errors.Wrap(err, "error getting repository")
 				}
 
@@ -789,11 +791,7 @@ func main() {
 					cmd := exec.CommandContext(wgetCtx, "wget", attachmentUrl, "-O", filePath)
 					output, err := cmd.CombinedOutput()
 					if err != nil {
-						progress.FailedReleases[release.Id] = err.Error()
-						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress, releasesOnly); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
+						fmt.Printf("Error downloading release asset %s: %v\nOutput: %s\n", attachment.Name, err, string(output))
 						return errors.Wrapf(err, "error downloading release asset: %s", string(output))
 					}
 
@@ -804,32 +802,20 @@ func main() {
 					cmd = exec.CommandContext(shaCtx, "sha256sum", filePath)
 					output, err = cmd.CombinedOutput()
 					if err != nil {
-						progress.FailedReleases[release.Id] = err.Error()
-						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress, releasesOnly); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
+						fmt.Printf("Error verifying sha256 for attachment %s: %v\n", attachment.Name, err)
 						return errors.Wrap(err, "error verifying sha256 for attachment")
 					}
 					calculatedHash := strings.Fields(string(output))[0]
 					if calculatedHash != attachment.Sha {
 						err := errors.Errorf("SHA256 mismatch for attachment %s: %s != %s", attachment.Name, calculatedHash, attachment.Sha)
-						progress.FailedReleases[release.Id] = err.Error()
-						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress, releasesOnly); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
+						fmt.Printf("SHA256 mismatch error: %v\n", err)
 						return err
 					}
 
 					// Pin to IPFS cluster
 					cid, err := shared.PinFile(ipfsClusterClient, filePath)
 					if err != nil {
-						progress.FailedReleases[release.Id] = err.Error()
-						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress, releasesOnly); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
+						fmt.Printf("Error pinning attachment %s: %v\n", attachment.Name, err)
 						return errors.Wrap(err, "error pinning attachment")
 					}
 
@@ -847,11 +833,7 @@ func main() {
 					// Compute merkle root and file info
 					rootHash, size, err := shared.ComputeFileInfo(filePath, cid)
 					if err != nil {
-						progress.FailedReleases[release.Id] = err.Error()
-						progress.LastFailedRelease = release.Id
-						if err := saveProgress(progress, releasesOnly); err != nil {
-							return errors.Wrap(err, "failed to save progress")
-						}
+						fmt.Printf("Error computing file info for attachment %s: %v\n", attachment.Name, err)
 						return errors.Wrapf(err, "error computing file info for attachment %s", attachment.Name)
 					}
 
@@ -879,22 +861,17 @@ func main() {
 					}
 
 					// Save progress after each attachment to prevent data loss
-					fmt.Printf("Saving progress after processing attachment %s\n", attachment.Name)
-					if err := saveProgress(progress, releasesOnly); err != nil {
-						fmt.Printf("Warning: failed to save progress after attachment: %v\n", err)
-					}
+					fmt.Printf("Saving storage state after processing attachment %s\n", attachment.Name)
 					if err := storageManager.Save(); err != nil {
 						fmt.Printf("Warning: failed to save storage manager after attachment: %v\n", err)
 					}
 					fmt.Printf("Completed processing attachment %s for release %s\n", attachment.Name, release.TagName)
 				}
 
-				// Mark release as successfully processed
-				delete(progress.FailedReleases, release.Id)
-				progress.ProcessedReleases[release.Id] = true
-				progress.LastProcessedReleaseID = release.Id
-				if err := saveProgress(progress, releasesOnly); err != nil {
-					return errors.Wrap(err, "failed to save progress")
+				// Mark release as successfully processed (only for releases without attachments)
+				if len(release.Attachments) == 0 {
+					// No need to track in progress file anymore - using database state
+					fmt.Printf("Release %s has no attachments and was processed successfully\n", release.TagName)
 				}
 
 				// Save storage manager state
