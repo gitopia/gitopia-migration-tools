@@ -375,8 +375,8 @@ func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
 // downloadFromIPFSCluster downloads a file from IPFS cluster using HTTP API
 func downloadFromIPFSCluster(cid, filePath string) error {
 	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false",
-		viper.GetString("IPFS_CLUSTER_PEER_HOST"),
-		viper.GetString("IPFS_CLUSTER_PEER_PORT"),
+		viper.GetString("IPFS_HOST"),
+		viper.GetString("IPFS_PORT"),
 		cid)
 
 	resp, err := http.Post(ipfsUrl, "application/json", nil)

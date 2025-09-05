@@ -111,7 +111,7 @@ func LoadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 				return errors.Wrapf(err, "error loading grandparent repository %d", parentRepository.Repository.Parent)
 			}
 		}
-		
+
 		// Set up alternates for parent repository
 		if _, err := os.Stat(grandParentRepoDir); err == nil {
 			alternatesPath := filepath.Join(parentRepoDir, "objects", "info", "alternates")
@@ -123,7 +123,7 @@ func LoadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 				return errors.Wrapf(err, "error creating alternates file for parent repo %d", parentRepoID)
 			}
 			logger.FromContext(ctx).WithFields(logrus.Fields{
-				"parent_id": parentRepoID,
+				"parent_id":      parentRepoID,
 				"grandparent_id": parentRepository.Repository.Parent,
 			}).Info("created alternates file linking parent repository to grandparent")
 		}
@@ -139,7 +139,7 @@ func LoadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 	// Parent packfile is already stored in IPFS cluster, no need to pin again
 	logger.FromContext(ctx).WithFields(logrus.Fields{
 		"parent_id": parentRepoID,
-		"cid": parentPackfile.CID,
+		"cid":       parentPackfile.CID,
 	}).Info("successfully loaded parent repository from IPFS")
 
 	return nil
@@ -170,11 +170,11 @@ func downloadPackfileFromIPFSCluster(cid, packfileName, repoDir string) error {
 
 // downloadFromIPFSClusterHTTP downloads a file from IPFS cluster using HTTP API
 func downloadFromIPFSClusterHTTP(cid, filePath string) error {
-	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false", 
-		viper.GetString("IPFS_CLUSTER_PEER_HOST"), 
-		viper.GetString("IPFS_CLUSTER_PEER_PORT"), 
+	ipfsUrl := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false",
+		viper.GetString("IPFS_HOST"),
+		viper.GetString("IPFS_PORT"),
 		cid)
-	
+
 	resp, err := http.Post(ipfsUrl, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch file from IPFS: %v", err)
@@ -197,4 +197,3 @@ func downloadFromIPFSClusterHTTP(cid, filePath string) error {
 
 	return nil
 }
-
