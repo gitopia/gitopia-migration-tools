@@ -152,7 +152,12 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 	// Clone repository
 	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
 	remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Owner.Id, repository.Name)
-	cmd := exec.Command("git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
+	
+	// Create context with timeout for git clone (30 minutes)
+	cloneCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	
+	cmd := exec.CommandContext(cloneCtx, "git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
 	if err := cmd.Run(); err != nil {
 		return errors.Wrapf(err, "error cloning repository %d", repoID)
 	}
@@ -183,8 +188,11 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		}
 	}
 
-	// Run git gc
-	cmd = exec.Command("git", "gc")
+	// Run git gc with timeout (10 minutes)
+	gcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	
+	cmd = exec.CommandContext(gcCtx, "git", "gc")
 	cmd.Dir = repoDir
 	if err := cmd.Run(); err != nil {
 		return errors.Wrapf(err, "error running git gc for repo %d", repoID)
@@ -195,7 +203,12 @@ func processRepositoryAtomic(ctx context.Context, repository *gitopiatypes.Repos
 		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
 		if _, err := os.Stat(alternatesPath); err == nil {
 			fmt.Printf("Running git repack to optimize forked repository %d\n", repoID)
-			cmd = exec.Command("git", "repack", "-a", "-d", "-l")
+			
+			// Create context with timeout for git repack (15 minutes)
+			repackCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+			defer cancel()
+			
+			cmd = exec.CommandContext(repackCtx, "git", "repack", "-a", "-d", "-l")
 			cmd.Dir = repoDir
 			if err := cmd.Run(); err != nil {
 				fmt.Printf("Warning: git repack failed for forked repo %d: %v\n", repoID, err)
@@ -302,7 +315,11 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 	// Initialize parent repository directory
 	parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", parentRepoID))
 	if _, err := os.Stat(filepath.Join(parentRepoDir, "objects")); os.IsNotExist(err) {
-		cmd := exec.Command("git", "init", "--bare", parentRepoDir)
+			// Create context with timeout for git init (5 minutes)
+		initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		
+		cmd := exec.CommandContext(initCtx, "git", "init", "--bare", parentRepoDir)
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "failed to initialize parent repository %d", parentRepoID)
 		}
@@ -336,8 +353,11 @@ func loadParentRepository(ctx context.Context, parentRepoID uint64, gitDir strin
 		}
 	}
 
-	// Run git gc on parent repository
-	cmd := exec.Command("git", "gc")
+	// Run git gc on parent repository with timeout (10 minutes)
+	parentGcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	
+	cmd := exec.CommandContext(parentGcCtx, "git", "gc")
 	cmd.Dir = parentRepoDir
 	if err := cmd.Run(); err != nil {
 		return errors.Wrapf(err, "error running git gc for parent repo %d", parentRepoID)
@@ -362,8 +382,11 @@ func downloadPackfileFromIPFS(cid, packfileName, repoDir string) error {
 		return errors.Wrap(err, "failed to download packfile from IPFS")
 	}
 
-	// Build pack index file
-	cmd := exec.Command("git", "index-pack", packfilePath)
+	// Build pack index file with timeout (10 minutes)
+	indexCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	
+	cmd := exec.CommandContext(indexCtx, "git", "index-pack", packfilePath)
 	cmd.Dir = repoDir
 	if err := cmd.Run(); err != nil {
 		return errors.Wrap(err, "failed to build pack index")
@@ -685,7 +708,12 @@ func main() {
 						attachment.Name)
 
 					filePath := filepath.Join(attachmentDir, attachment.Sha)
-					cmd := exec.Command("wget", attachmentUrl, "-O", filePath)
+					
+					// Create context with timeout for wget (20 minutes)
+					wgetCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+					defer cancel()
+					
+					cmd := exec.CommandContext(wgetCtx, "wget", attachmentUrl, "-O", filePath)
 					output, err := cmd.CombinedOutput()
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
@@ -696,8 +724,11 @@ func main() {
 						return errors.Wrapf(err, "error downloading release asset: %s", string(output))
 					}
 
-					// Verify sha256
-					cmd = exec.Command("sha256sum", filePath)
+					// Verify sha256 with timeout (5 minutes)
+					shaCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+					defer cancel()
+					
+					cmd = exec.CommandContext(shaCtx, "sha256sum", filePath)
 					output, err = cmd.Output()
 					if err != nil {
 						progress.FailedReleases[release.Id] = err.Error()
