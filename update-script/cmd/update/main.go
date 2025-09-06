@@ -77,6 +77,13 @@ func (btm *BatchTxManager) FlushBatch(ctx context.Context) error {
 // processRepositoryPackfiles processes repository packfiles using stored data
 func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allPackfiles := storageManager.GetAllPackfileInfo()
+	
+	if allPackfiles == nil {
+		fmt.Println("No packfile data retrieved (could be empty or error)")
+		return nil
+	}
+	
+	fmt.Printf("Found %d packfiles to process\n", len(allPackfiles))
 
 	for _, packfileInfo := range allPackfiles {
 		msg := &storagetypes.MsgUpdateRepositoryPackfile{
@@ -103,6 +110,13 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 // processReleaseAssets processes release assets using stored data
 func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allReleaseAssets := storageManager.GetAllReleaseAssets()
+	
+	if allReleaseAssets == nil {
+		fmt.Println("No release asset data retrieved (could be empty or error)")
+		return nil
+	}
+	
+	fmt.Printf("Found %d release assets to process\n", len(allReleaseAssets))
 
 	// Group assets by repository and tag
 	assetsByRelease := make(map[string][]*shared.ReleaseAssetInfo)
@@ -150,6 +164,13 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 // processLFSObjects processes LFS objects using stored data
 func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allLFSObjects := storageManager.GetAllLFSObjects()
+	
+	if allLFSObjects == nil {
+		fmt.Println("No LFS object data retrieved (could be empty or error)")
+		return nil
+	}
+	
+	fmt.Printf("Found %d LFS objects to process\n", len(allLFSObjects))
 
 	for _, lfsInfo := range allLFSObjects {
 		msg := &storagetypes.MsgUpdateLFSObject{
@@ -184,10 +205,14 @@ func main() {
 			ctx := cmd.Context()
 
 			// Initialize storage manager
-			storageManager := shared.NewStorageManager(viper.GetString("WORKING_DIR"))
+			workingDir := viper.GetString("WORKING_DIR")
+			fmt.Printf("Using working directory: %s\n", workingDir)
+			
+			storageManager := shared.NewStorageManager(workingDir)
 			if err := storageManager.Load(); err != nil {
 				return errors.Wrap(err, "failed to load storage manager")
 			}
+			fmt.Println("Storage manager loaded successfully")
 
 			// Initialize Gitopia client
 			clientCtx := client.GetClientContextFromCmd(cmd)

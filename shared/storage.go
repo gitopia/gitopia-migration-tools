@@ -393,8 +393,14 @@ func (sm *StorageManager) GetAllPackfileInfo() []*PackfileInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
+	if sm.db == nil {
+		fmt.Printf("Error: Database connection is nil\n")
+		return nil
+	}
+
 	rows, err := sm.db.Query("SELECT repository_id, name, cid, root_hash, size, updated_at, updated_by FROM packfiles")
 	if err != nil {
+		fmt.Printf("Error querying packfiles: %v\n", err)
 		return nil
 	}
 	defer rows.Close()
@@ -406,12 +412,14 @@ func (sm *StorageManager) GetAllPackfileInfo() []*PackfileInfo {
 		var size int64
 		var updatedAt time.Time
 		if err := rows.Scan(&repositoryID, &name, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
+			fmt.Printf("Error scanning packfile row: %v\n", err)
 			continue
 		}
 
 		// Convert hex string back to bytes
 		rootHash, err := hex.DecodeString(rootHashHex)
 		if err != nil {
+			fmt.Printf("Error decoding root hash for packfile %d: %v\n", repositoryID, err)
 			continue
 		}
 
@@ -425,6 +433,7 @@ func (sm *StorageManager) GetAllPackfileInfo() []*PackfileInfo {
 			UpdatedBy:    updatedBy,
 		})
 	}
+	fmt.Printf("Retrieved %d packfile records\n", len(result))
 	return result
 }
 
@@ -433,8 +442,14 @@ func (sm *StorageManager) GetAllLFSObjects() []*LFSObjectInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
+	if sm.db == nil {
+		fmt.Printf("Error: Database connection is nil\n")
+		return nil
+	}
+
 	rows, err := sm.db.Query("SELECT repository_id, oid, cid, root_hash, size, updated_at, updated_by FROM lfs_objects")
 	if err != nil {
+		fmt.Printf("Error querying LFS objects: %v\n", err)
 		return nil
 	}
 	defer rows.Close()
@@ -446,12 +461,14 @@ func (sm *StorageManager) GetAllLFSObjects() []*LFSObjectInfo {
 		var size int64
 		var updatedAt time.Time
 		if err := rows.Scan(&repositoryID, &oid, &cid, &rootHashHex, &size, &updatedAt, &updatedBy); err != nil {
+			fmt.Printf("Error scanning LFS object row: %v\n", err)
 			continue
 		}
 
 		// Convert hex string back to bytes
 		rootHash, err := hex.DecodeString(rootHashHex)
 		if err != nil {
+			fmt.Printf("Error decoding root hash for LFS object %s: %v\n", oid, err)
 			continue
 		}
 
@@ -465,17 +482,24 @@ func (sm *StorageManager) GetAllLFSObjects() []*LFSObjectInfo {
 			UpdatedBy:    updatedBy,
 		})
 	}
+	fmt.Printf("Retrieved %d LFS object records\n", len(result))
 	return result
 }
 
 // GetAllReleaseAssets returns all release asset information
-func (sm *StorageManager) GetAllReleaseAssets() map[string]*ReleaseAssetInfo {
+func (sm *StorageManager) GetAllReleaseAssets() []*ReleaseAssetInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	result := make(map[string]*ReleaseAssetInfo)
+	if sm.db == nil {
+		fmt.Printf("Error: Database connection is nil\n")
+		return nil
+	}
+
+	var result []*ReleaseAssetInfo
 	rows, err := sm.db.Query("SELECT repository_id, tag_name, name, cid, root_hash, size, sha256, updated_at, updated_by FROM release_assets")
 	if err != nil {
+		fmt.Printf("Error querying release assets: %v\n", err)
 		return nil
 	}
 	defer rows.Close()
@@ -486,16 +510,18 @@ func (sm *StorageManager) GetAllReleaseAssets() map[string]*ReleaseAssetInfo {
 		var size int64
 		var updatedAt time.Time
 		if err := rows.Scan(&repositoryID, &tagName, &name, &cid, &rootHashHex, &size, &sha256, &updatedAt, &updatedBy); err != nil {
+			fmt.Printf("Error scanning release asset row: %v\n", err)
 			continue
 		}
 
 		// Convert hex string back to bytes
 		rootHash, err := hex.DecodeString(rootHashHex)
 		if err != nil {
+			fmt.Printf("Error decoding root hash for release asset %s: %v\n", name, err)
 			continue
 		}
 
-		result[fmt.Sprintf("%d:%s:%s", repositoryID, tagName, name)] = &ReleaseAssetInfo{
+		result = append(result, &ReleaseAssetInfo{
 			RepositoryID: repositoryID,
 			TagName:      tagName,
 			Name:         name,
@@ -505,8 +531,9 @@ func (sm *StorageManager) GetAllReleaseAssets() map[string]*ReleaseAssetInfo {
 			SHA256:       sha256,
 			UpdatedAt:    updatedAt,
 			UpdatedBy:    updatedBy,
-		}
+		})
 	}
+	fmt.Printf("Retrieved %d release asset records\n", len(result))
 	return result
 }
 
