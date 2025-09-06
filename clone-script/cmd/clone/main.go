@@ -491,6 +491,119 @@ func downloadFromIPFSCluster(cid, filePath string) error {
 	return nil
 }
 
+// processFailedRepositoryFromDisk processes a repository that was copied to the repo directory
+func processFailedRepositoryFromDisk(ctx context.Context, repoID uint64, repository *gitopiatypes.Repository,
+	gitDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager,
+	gitopiaClient *gc.Client, pinataClient *shared.PinataClient) error {
+
+	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
+
+	// Check if repository directory exists
+	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
+		return fmt.Errorf("repository directory %s does not exist", repoDir)
+	}
+
+	// If this is a fork, ensure parent repository exists
+	if repository.Fork {
+		fmt.Printf("Repository %d is a fork of %d, checking parent availability\n", repoID, repository.Parent)
+		parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
+
+		if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+			fmt.Printf("Parent repository %d not found, fetching from IPFS\n", repository.Parent)
+
+			// Load parent repository from IPFS
+			if err := loadParentRepository(ctx, repository.Parent, gitDir, ipfsClusterClient, storageManager, gitopiaClient); err != nil {
+				return errors.Wrapf(err, "failed to load parent repository %d from IPFS", repository.Parent)
+			}
+		}
+
+		// Set up alternates for the fork
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if _, err := os.Stat(alternatesPath); os.IsNotExist(err) {
+			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+				return errors.Wrap(err, "failed to create alternates directory")
+			}
+			parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+			if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+				return errors.Wrap(err, "failed to create alternates file")
+			}
+			fmt.Printf("Created alternates file linking fork %d to parent %d\n", repoID, repository.Parent)
+		}
+	}
+
+	// Check packfiles in the repository
+	packDir := filepath.Join(repoDir, "objects", "pack")
+	packFiles, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
+	if err != nil {
+		return errors.Wrapf(err, "error finding packfiles for repo %d", repoID)
+	}
+
+	// If there are no packfiles or more than one packfile, run git gc
+	if len(packFiles) == 0 || len(packFiles) > 1 {
+		fmt.Printf("Repository %d has %d packfiles, running git gc\n", repoID, len(packFiles))
+
+		// Run git gc with timeout (10 minutes)
+		gcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+
+		gcCmd := exec.CommandContext(gcCtx, "git", "gc")
+		gcCmd.Dir = repoDir
+		if output, err := gcCmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "error running git gc for repo %d: %s", repoID, string(output))
+		}
+
+		// Re-check packfiles after gc
+		packFiles, err = filepath.Glob(filepath.Join(packDir, "*.pack"))
+		if err != nil {
+			return errors.Wrapf(err, "error finding packfiles after gc for repo %d", repoID)
+		}
+		fmt.Printf("After git gc, repository %d now has %d packfiles\n", repoID, len(packFiles))
+	}
+
+	// If there is exactly one packfile, pin it and update the database
+	if len(packFiles) == 1 {
+		packfileName := packFiles[0]
+		fmt.Printf("Repository %d has one packfile, pinning to IPFS: %s\n", repoID, filepath.Base(packfileName))
+
+		// Pin packfile to IPFS cluster
+		cid, err := shared.PinFile(ipfsClusterClient, packfileName)
+		if err != nil {
+			return errors.Wrapf(err, "error pinning packfile for repo %d", repoID)
+		}
+
+		rootHash, size, err := shared.ComputeFileInfo(packfileName, cid)
+		if err != nil {
+			return errors.Wrapf(err, "error computing file info for packfile repo %d", repoID)
+		}
+
+		packfileInfo := &shared.PackfileInfo{
+			RepositoryID: repoID,
+			Name:         filepath.Base(packfileName),
+			CID:          cid,
+			RootHash:     rootHash,
+			Size:         size,
+			UpdatedAt:    time.Now(),
+			UpdatedBy:    "clone",
+		}
+		storageManager.SetPackfileInfo(packfileInfo)
+		fmt.Printf("Successfully pinned packfile for repository %d (CID: %s)\n", repoID, cid)
+
+		// Pin to Pinata if enabled
+		if pinataClient != nil {
+			resp, err := pinataClient.PinFile(ctx, packfileName, filepath.Base(packfileName))
+			if err != nil {
+				fmt.Printf("Warning: failed to pin packfile to Pinata for repo %d: %v\n", repoID, err)
+			} else {
+				fmt.Printf("Successfully pinned packfile to Pinata for repository %d (Pinata ID: %s)\n", repoID, resp.Data.ID)
+			}
+		}
+	} else {
+		fmt.Printf("Repository %d has %d packfiles after gc, skipping pinning\n", repoID, len(packFiles))
+	}
+
+	return nil
+}
+
 func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) error {
 	lfsObjectsDir := filepath.Join(repoDir, "lfs", "objects")
 
@@ -673,10 +786,10 @@ func main() {
 				const maxRepositoryID uint64 = 62973
 
 				if retryFailed {
-					fmt.Printf("Starting retry of failed repositories from progress file\n")
+					fmt.Printf("Starting retry of failed repositories from repo directory\n")
 					fmt.Printf("Found %d failed repositories to retry\n", len(progress.FailedRepos))
 
-					// Process only failed repositories
+					// Process only failed repositories from the repo directory
 					for repoID, failureReason := range progress.FailedRepos {
 						fmt.Printf("Retrying failed repository ID %d (previous failure: %s)\n", repoID, failureReason)
 
@@ -695,15 +808,15 @@ func main() {
 
 						repository := repositoryResp.Repository
 
-						fmt.Printf("Processing repository %d (%d/%d)\n", repository.Id, processedCount+1, len(progress.FailedRepos))
+						fmt.Printf("Processing repository %d from disk (%d/%d)\n", repository.Id, processedCount+1, len(progress.FailedRepos))
 
-						// Use atomic processing function
-						if err := processRepositoryAtomic(ctx, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, progress, pinataClient); err != nil {
+						// Use new disk-based processing function
+						if err := processFailedRepositoryFromDisk(ctx, repository.Id, repository, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, pinataClient); err != nil {
 							progress.FailedRepos[repository.Id] = err.Error()
 							if err := saveProgress(progress, releasesOnly); err != nil {
 								return errors.Wrap(err, "failed to save progress")
 							}
-							return errors.Wrapf(err, "error processing repository %d", repository.Id)
+							return errors.Wrapf(err, "error processing repository %d from disk", repository.Id)
 						}
 
 						// Mark repository as successfully processed - remove from failed repos but don't update last processed ID
@@ -718,10 +831,12 @@ func main() {
 						}
 
 						processedCount++
-						fmt.Printf("Successfully retried repository %d\n", repository.Id)
+						fmt.Printf("Successfully retried repository %d from disk\n", repository.Id)
 					}
 
-					fmt.Printf("Retry processing complete - processed %d failed repositories\n", processedCount)
+					fmt.Printf("Retry processing complete - processed %d failed repositories from disk\n", processedCount)
+
+					return nil
 				} else {
 					fmt.Printf("Starting repository processing from ID 0 to %d\n", maxRepositoryID)
 
