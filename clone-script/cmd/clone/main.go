@@ -781,6 +781,121 @@ func loadRepositoryFromIPFS(ctx context.Context, repoID uint64, gitDir string, i
 	return nil
 }
 
+// updateRepository updates a specific repository by cloning it, updating the packfile,
+// handling pinning/unpinning of old packfiles, and updating the database
+func updateRepository(ctx context.Context, repoID uint64, gitDir string, ipfsClusterClient ipfsclusterclient.Client,
+	storageManager *shared.StorageManager, gitopiaClient *gc.Client, pinataClient *shared.PinataClient) error {
+
+	fmt.Printf("Starting update process for repository %d\n", repoID)
+
+	// Get repository info from Gitopia
+	repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+		Id: repoID,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to get repository %d info", repoID)
+	}
+
+	repository := repositoryResp.Repository
+	fmt.Printf("Found repository: %s/%s (ID: %d)\n", repository.Owner.Id, repository.Name, repoID)
+
+	// Check if repository is empty
+	_, err = gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+		Id:             repository.Owner.Id,
+		RepositoryName: repository.Name,
+		BranchName:     repository.DefaultBranch,
+	})
+	if err != nil {
+		return errors.Errorf("repository %d is empty or has no default branch", repoID)
+	}
+
+	// Get existing packfile info from database to unpin old one later
+	existingPackfile := storageManager.GetPackfileInfo(repoID)
+	var oldCID string
+	if existingPackfile != nil {
+		oldCID = existingPackfile.CID
+		fmt.Printf("Found existing packfile for repository %d (CID: %s, UpdatedBy: %s)\n", repoID, oldCID, existingPackfile.UpdatedBy)
+	} else {
+		fmt.Printf("No existing packfile found for repository %d in database\n", repoID)
+	}
+
+	// Set up repository directory path
+	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
+
+	// Check if repository directory exists
+	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
+		return errors.Errorf("repository directory %s does not exist", repoDir)
+	}
+
+	fmt.Printf("Using existing repository directory: %s\n", repoDir)
+
+	// Find and pin the new packfile
+	packDir := filepath.Join(repoDir, "objects", "pack")
+	packFiles, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
+	if err != nil {
+		return errors.Wrapf(err, "error finding packfiles for repo %d", repoID)
+	}
+
+	if len(packFiles) > 0 {
+		packfileName := packFiles[0]
+		fmt.Printf("Pinning new packfile for repository %d: %s\n", repoID, filepath.Base(packfileName))
+
+		// Pin new packfile to IPFS cluster
+		newCID, err := shared.PinFile(ipfsClusterClient, packfileName)
+		if err != nil {
+			return errors.Wrapf(err, "error pinning new packfile for repo %d", repoID)
+		}
+
+		// Compute file info for the new packfile
+		rootHash, size, err := shared.ComputeFileInfo(packfileName, newCID)
+		if err != nil {
+			return errors.Wrapf(err, "error computing file info for new packfile repo %d", repoID)
+		}
+
+		// Update database with new packfile info
+		packfileInfo := &shared.PackfileInfo{
+			RepositoryID: repoID,
+			Name:         filepath.Base(packfileName),
+			CID:          newCID,
+			RootHash:     rootHash,
+			Size:         size,
+			UpdatedAt:    time.Now(),
+			UpdatedBy:    "clone", // Mark as updated by clone script
+		}
+		storageManager.SetPackfileInfo(packfileInfo)
+		fmt.Printf("Successfully pinned new packfile for repository %d (CID: %s)\n", repoID, newCID)
+
+		// Pin to Pinata if enabled
+		if pinataClient != nil {
+			resp, err := pinataClient.PinFile(ctx, packfileName, filepath.Base(packfileName))
+			if err != nil {
+				fmt.Printf("Warning: failed to pin new packfile to Pinata for repo %d: %v\n", repoID, err)
+			} else {
+				fmt.Printf("Successfully pinned new packfile to Pinata for repository %d (Pinata ID: %s)\n", repoID, resp.Data.ID)
+			}
+		}
+
+		// Unpin old packfile from IPFS cluster if it exists and is different
+		if oldCID != "" && oldCID != newCID {
+			fmt.Printf("Unpinning old packfile for repository %d (CID: %s)\n", repoID, oldCID)
+			if err := shared.UnpinFile(ipfsClusterClient, oldCID); err != nil {
+				fmt.Printf("Warning: failed to unpin old packfile for repo %d (CID: %s): %v\n", repoID, oldCID, err)
+			} else {
+				fmt.Printf("Successfully unpinned old packfile for repository %d (CID: %s)\n", repoID, oldCID)
+			}
+		} else if oldCID == newCID {
+			fmt.Printf("New packfile CID is same as old CID (%s), no unpinning needed\n", newCID)
+		}
+	} else if repository.Fork {
+		fmt.Printf("Forked repository %d has no packfile (no new changes), using parent objects via alternates\n", repoID)
+	} else {
+		return errors.Errorf("repository %d has no packfile", repoID)
+	}
+
+	fmt.Printf("Successfully updated repository %d\n", repoID)
+	return nil
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:               "clone-script",
@@ -806,6 +921,12 @@ func main() {
 			loadFromIPFS, err := cmd.Flags().GetUint64("load-from-ipfs")
 			if err != nil {
 				return errors.Wrap(err, "failed to get load-from-ipfs flag")
+			}
+
+			// Get the update-repo flag
+			updateRepo, err := cmd.Flags().GetUint64("update-repo")
+			if err != nil {
+				return errors.Wrap(err, "failed to get update-repo flag")
 			}
 
 			// Create required directories
@@ -870,6 +991,12 @@ func main() {
 			if loadFromIPFS > 0 {
 				fmt.Printf("Loading repository %d from IPFS into repo directory\n", loadFromIPFS)
 				return loadRepositoryFromIPFS(ctx, loadFromIPFS, gitDir, ipfsClusterClient, storageManager, &gitopiaClient)
+			}
+
+			// Handle update-repo mode
+			if updateRepo > 0 {
+				fmt.Printf("Updating repository %d - will update packfile, handle pinning/unpinning, and update database\n", updateRepo)
+				return updateRepository(ctx, updateRepo, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, pinataClient)
 			}
 
 			// Process repositories only if not in releases-only mode
@@ -1119,6 +1246,7 @@ func main() {
 	rootCmd.Flags().Bool("releases-only", false, "Process only releases, skip repository cloning")
 	rootCmd.Flags().Bool("retry-failed", false, "Retry only failed repositories from progress file")
 	rootCmd.Flags().Uint64("load-from-ipfs", 0, "Load a specific repository from IPFS by repository ID")
+	rootCmd.Flags().Uint64("update-repo", 0, "Update a specific repository by repository ID (updates packfile, handles pinning/unpinning, updates database)")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
