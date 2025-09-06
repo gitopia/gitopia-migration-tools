@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -24,19 +23,8 @@ const (
 	AccountAddressPrefix = "gitopia"
 	AccountPubKeyPrefix  = AccountAddressPrefix + sdk.PrefixPublic
 	AppName              = "update-script"
-	ProgressFile         = "update_progress.json"
-	BATCH_SIZE           = 100 // Process 100 messages per block
+	BATCH_SIZE           = 10 // Process 10 messages per block
 )
-
-type UpdateProgress struct {
-	ProcessedRepos      map[uint64]bool   `json:"processed_repos"`
-	ProcessedReleases   map[string]bool   `json:"processed_releases"`
-	ProcessedLFSObjects map[string]bool   `json:"processed_lfs_objects"`
-	FailedRepos         map[uint64]string `json:"failed_repos"`
-	FailedReleases      map[string]string `json:"failed_releases"`
-	FailedLFSObjects    map[string]string `json:"failed_lfs_objects"`
-	TotalProcessed      uint64            `json:"total_processed"`
-}
 
 type BatchTxManager struct {
 	client    gc.Client
@@ -86,70 +74,11 @@ func (btm *BatchTxManager) FlushBatch(ctx context.Context) error {
 	return btm.ProcessBatch(ctx)
 }
 
-// loadProgress loads progress from file
-func loadProgress() (*UpdateProgress, error) {
-	if _, err := os.Stat(ProgressFile); os.IsNotExist(err) {
-		return &UpdateProgress{
-			ProcessedRepos:      make(map[uint64]bool),
-			ProcessedReleases:   make(map[string]bool),
-			ProcessedLFSObjects: make(map[string]bool),
-			FailedRepos:         make(map[uint64]string),
-			FailedReleases:      make(map[string]string),
-			FailedLFSObjects:    make(map[string]string),
-		}, nil
-	}
-
-	data, err := os.ReadFile(ProgressFile)
-	if err != nil {
-		return nil, err
-	}
-
-	var progress UpdateProgress
-	if err := json.Unmarshal(data, &progress); err != nil {
-		return nil, err
-	}
-
-	// Initialize maps if nil
-	if progress.ProcessedRepos == nil {
-		progress.ProcessedRepos = make(map[uint64]bool)
-	}
-	if progress.ProcessedReleases == nil {
-		progress.ProcessedReleases = make(map[string]bool)
-	}
-	if progress.ProcessedLFSObjects == nil {
-		progress.ProcessedLFSObjects = make(map[string]bool)
-	}
-	if progress.FailedRepos == nil {
-		progress.FailedRepos = make(map[uint64]string)
-	}
-	if progress.FailedReleases == nil {
-		progress.FailedReleases = make(map[string]string)
-	}
-	if progress.FailedLFSObjects == nil {
-		progress.FailedLFSObjects = make(map[string]string)
-	}
-
-	return &progress, nil
-}
-
-// saveProgress saves progress to file
-func saveProgress(progress *UpdateProgress) error {
-	data, err := json.MarshalIndent(progress, "", "  ")
-	if err != nil {
-		return errors.Wrap(err, "failed to marshal progress")
-	}
-	return os.WriteFile(ProgressFile, data, 0644)
-}
-
 // processRepositoryPackfiles processes repository packfiles using stored data
-func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
+func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allPackfiles := storageManager.GetAllPackfileInfo()
 
 	for _, packfileInfo := range allPackfiles {
-		if progress.ProcessedRepos[packfileInfo.RepositoryID] {
-			continue // Skip already processed
-		}
-
 		msg := &storagetypes.MsgUpdateRepositoryPackfile{
 			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: packfileInfo.RepositoryID,
@@ -161,13 +90,10 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 		}
 
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
-			progress.FailedRepos[packfileInfo.RepositoryID] = err.Error()
 			fmt.Printf("Failed to add packfile update for repo %d: %v\n", packfileInfo.RepositoryID, err)
 			continue
 		}
 
-		progress.ProcessedRepos[packfileInfo.RepositoryID] = true
-		progress.TotalProcessed++
 		fmt.Printf("Added packfile update for repository %d to batch\n", packfileInfo.RepositoryID)
 	}
 
@@ -175,16 +101,13 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 }
 
 // processReleaseAssets processes release assets using stored data
-func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
+func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allReleaseAssets := storageManager.GetAllReleaseAssets()
 
 	// Group assets by repository and tag
 	assetsByRelease := make(map[string][]*shared.ReleaseAssetInfo)
 	for _, assetInfo := range allReleaseAssets {
 		releaseKey := fmt.Sprintf("%d-%s", assetInfo.RepositoryID, assetInfo.TagName)
-		if progress.ProcessedReleases[releaseKey] {
-			continue // Skip already processed
-		}
 		assetsByRelease[releaseKey] = append(assetsByRelease[releaseKey], assetInfo)
 	}
 
@@ -214,13 +137,10 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 		}
 
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
-			progress.FailedReleases[releaseKey] = err.Error()
 			fmt.Printf("Failed to add release assets update for %s: %v\n", releaseKey, err)
 			continue
 		}
 
-		progress.ProcessedReleases[releaseKey] = true
-		progress.TotalProcessed++
 		fmt.Printf("Added release assets update for %s to batch (%d assets)\n", releaseKey, len(assets))
 	}
 
@@ -228,15 +148,10 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 }
 
 // processLFSObjects processes LFS objects using stored data
-func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager, progress *UpdateProgress) error {
+func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allLFSObjects := storageManager.GetAllLFSObjects()
 
 	for _, lfsInfo := range allLFSObjects {
-		lfsKey := fmt.Sprintf("%d-%s", lfsInfo.RepositoryID, lfsInfo.OID)
-		if progress.ProcessedLFSObjects[lfsKey] {
-			continue // Skip already processed
-		}
-
 		msg := &storagetypes.MsgUpdateLFSObject{
 			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: lfsInfo.RepositoryID,
@@ -247,14 +162,11 @@ func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageMan
 		}
 
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
-			progress.FailedLFSObjects[lfsKey] = err.Error()
-			fmt.Printf("Failed to add LFS object update for %s: %v\n", lfsKey, err)
+			fmt.Printf("Failed to add LFS object update for %s: %v\n", lfsInfo.OID, err)
 			continue
 		}
 
-		progress.ProcessedLFSObjects[lfsKey] = true
-		progress.TotalProcessed++
-		fmt.Printf("Added LFS object update for %s to batch\n", lfsKey)
+		fmt.Printf("Added LFS object update for %s to batch\n", lfsInfo.OID)
 	}
 
 	return nil
@@ -270,12 +182,6 @@ func main() {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-
-			// Load progress
-			progress, err := loadProgress()
-			if err != nil {
-				return errors.Wrap(err, "failed to load progress")
-			}
 
 			// Initialize storage manager
 			storageManager := shared.NewStorageManager(viper.GetString("WORKING_DIR"))
@@ -303,19 +209,19 @@ func main() {
 
 			// Process repository packfiles
 			fmt.Println("Processing repository packfiles...")
-			if err := processRepositoryPackfiles(ctx, batchMgr, storageManager, progress); err != nil {
+			if err := processRepositoryPackfiles(ctx, batchMgr, storageManager); err != nil {
 				return errors.Wrap(err, "failed to process repository packfiles")
 			}
 
 			// Process release assets
 			fmt.Println("Processing release assets...")
-			if err := processReleaseAssets(ctx, batchMgr, storageManager, progress); err != nil {
+			if err := processReleaseAssets(ctx, batchMgr, storageManager); err != nil {
 				return errors.Wrap(err, "failed to process release assets")
 			}
 
 			// Process LFS objects
 			fmt.Println("Processing LFS objects...")
-			if err := processLFSObjects(ctx, batchMgr, storageManager, progress); err != nil {
+			if err := processLFSObjects(ctx, batchMgr, storageManager); err != nil {
 				return errors.Wrap(err, "failed to process LFS objects")
 			}
 
@@ -324,14 +230,7 @@ func main() {
 				return errors.Wrap(err, "failed to flush final batch")
 			}
 
-			// Save final progress
-			if err := saveProgress(progress); err != nil {
-				return errors.Wrap(err, "failed to save final progress")
-			}
-
-			fmt.Printf("Update script completed successfully! Total processed: %d\n", progress.TotalProcessed)
-			fmt.Printf("Failed repos: %d, Failed releases: %d, Failed LFS objects: %d\n",
-				len(progress.FailedRepos), len(progress.FailedReleases), len(progress.FailedLFSObjects))
+			fmt.Println("Update script completed successfully!")
 
 			return nil
 		},
