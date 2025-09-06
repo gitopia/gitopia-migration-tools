@@ -1,0 +1,19 @@
+# Verify Script Configuration for Gitopia v5.1.0
+
+# Server Configuration
+WORKING_DIR = "/var/gitopia-migration"
+
+# Gitopia Network Configuration (v5.1.0)
+GITOPIA_ADDR = "gitopia-grpc.polkachu.com:11390"
+TM_ADDR = "https://gitopia-rpc.polkachu.com:443"
+CHAIN_ID = "gitopia"
+GAS_PRICES = "0.001ulore"
+
+# IPFS Configuration
+IPFS_HOST = "127.0.0.1"
+IPFS_PORT = "5001"
+
+# Verification Configuration
+# Number of concurrent workers for repository verification (default: 10)
+# Higher values increase speed but use more resources (CPU, memory, network)
+VERIFY_CONCURRENCY = 10
