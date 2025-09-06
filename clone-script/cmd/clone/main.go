@@ -604,6 +604,79 @@ func processFailedRepositoryFromDisk(ctx context.Context, repoID uint64, reposit
 	return nil
 }
 
+func processLFSFromDirectory(ctx context.Context, lfsObjectsDir string, repoOIDMap map[uint64][]string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) error {
+	fmt.Printf("Processing LFS objects from directory: %s\n", lfsObjectsDir)
+
+	for repositoryId, oids := range repoOIDMap {
+		fmt.Printf("Processing %d LFS objects for repository %d\n", len(oids), repositoryId)
+
+		for i, oid := range oids {
+			fmt.Printf("Processing LFS object %d/%d: %s for repository %d\n", i+1, len(oids), oid, repositoryId)
+
+			// Check if LFS object already exists in database
+			existingLFS := storageManager.GetLFSObjectInfo(repositoryId, oid)
+			if existingLFS != nil {
+				fmt.Printf("LFS object %s for repository %d already exists in database (UpdatedBy: %s), skipping\n", oid, repositoryId, existingLFS.UpdatedBy)
+				continue
+			}
+
+			// Construct path based on directory structure: first_char/second_char/full_oid
+			oidPath := filepath.Join(lfsObjectsDir, string(oid[0]), string(oid[1]), oid)
+
+			// Check if file exists
+			if _, err := os.Stat(oidPath); os.IsNotExist(err) {
+				fmt.Printf("Warning: LFS object file %s not found at path %s\n", oid, oidPath)
+				continue
+			}
+
+			// Pin to IPFS cluster
+			cid, err := shared.PinFile(ipfsClusterClient, oidPath)
+			if err != nil {
+				return errors.Wrapf(err, "error pinning LFS object %s for repository %d", oid, repositoryId)
+			}
+
+			// Compute merkle root and file info
+			rootHash, size, err := shared.ComputeFileInfo(oidPath, cid)
+			if err != nil {
+				return errors.Wrapf(err, "error computing file info for LFS object %s", oid)
+			}
+
+			// Store LFS object information
+			lfsInfo := &shared.LFSObjectInfo{
+				RepositoryID: repositoryId,
+				OID:          oid,
+				CID:          cid,
+				RootHash:     rootHash,
+				Size:         size,
+				UpdatedAt:    time.Now(),
+				UpdatedBy:    "clone",
+			}
+			storageManager.SetLFSObjectInfo(lfsInfo)
+
+			fmt.Printf("Successfully pinned LFS object %s for repository %d (CID: %s)\n", oid, repositoryId, cid)
+
+			// Pin to Pinata if enabled
+			if pinataClient != nil {
+				resp, err := pinataClient.PinFile(ctx, oidPath, oid)
+				if err != nil {
+					fmt.Printf("Warning: failed to pin LFS object to Pinata for repo %d, oid %s: %v\n", repositoryId, oid, err)
+				} else {
+					fmt.Printf("Successfully pinned LFS object to Pinata for repository %d, oid %s (Pinata ID: %s)\n", repositoryId, oid, resp.Data.ID)
+				}
+			}
+
+			// Save storage manager state after each LFS object
+			if err := storageManager.Save(); err != nil {
+				fmt.Printf("Warning: failed to save storage manager after LFS object %s: %v\n", oid, err)
+			}
+		}
+
+		fmt.Printf("Completed processing %d LFS objects for repository %d\n", len(oids), repositoryId)
+	}
+
+	return nil
+}
+
 func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, pinataClient *shared.PinataClient) error {
 	lfsObjectsDir := filepath.Join(repoDir, "lfs", "objects")
 
@@ -929,6 +1002,12 @@ func main() {
 				return errors.Wrap(err, "failed to get update-repo flag")
 			}
 
+			// Get the process-lfs flag
+			processLFS, err := cmd.Flags().GetString("process-lfs")
+			if err != nil {
+				return errors.Wrap(err, "failed to get process-lfs flag")
+			}
+
 			// Create required directories
 			gitDir := viper.GetString("GIT_REPOS_DIR")
 			if err := os.MkdirAll(gitDir, 0755); err != nil {
@@ -997,6 +1076,25 @@ func main() {
 			if updateRepo > 0 {
 				fmt.Printf("Updating repository %d - will update packfile, handle pinning/unpinning, and update database\n", updateRepo)
 				return updateRepository(ctx, updateRepo, gitDir, ipfsClusterClient, storageManager, &gitopiaClient, pinataClient)
+			}
+
+			// Handle process-lfs mode
+			if processLFS != "" {
+				fmt.Printf("Processing LFS objects from directory: %s\n", processLFS)
+
+				// Define repository ID to OIDs mapping based on your provided data
+				repoOIDMap := map[uint64][]string{
+					58871: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					58931: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					58989: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					59050: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					58993: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					59052: {"0b7810a9fef2b44e9381e7f4e8ffd699a71e359931ab236bcc356ab8fd2a4575", "1cdb76087fabcca7709fc563b44b5de98aaf297eedc8805aa2884999e6bab06d", "8cad0e1bbc7f04182602d2ef34ebf498bfb28ff8ba533059184bafa5a66ab34d", "a276ad3f3cd30092d9fb915b16e7661f59e9a2a0ab1571dc01c90fa967f2f7af"},
+					62953: {"cc6986f83e08e64b92f991529c4724d2fd07b64f9e814576357983b973f97b90"},
+					0:     {"7a3c4aee3aa1ab49eec2b402918d74d227f900c7e97d62fb1fd4bc4feadafa24"},
+				}
+
+				return processLFSFromDirectory(ctx, processLFS, repoOIDMap, ipfsClusterClient, storageManager, pinataClient)
 			}
 
 			// Process repositories only if not in releases-only mode
@@ -1247,6 +1345,7 @@ func main() {
 	rootCmd.Flags().Bool("retry-failed", false, "Retry only failed repositories from progress file")
 	rootCmd.Flags().Uint64("load-from-ipfs", 0, "Load a specific repository from IPFS by repository ID")
 	rootCmd.Flags().Uint64("update-repo", 0, "Update a specific repository by repository ID (updates packfile, handles pinning/unpinning, updates database)")
+	rootCmd.Flags().String("process-lfs", "", "Process LFS objects from specified directory path for predefined repositories")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
