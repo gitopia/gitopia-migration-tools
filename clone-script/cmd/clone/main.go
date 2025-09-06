@@ -700,6 +700,87 @@ func processLFSObjects(ctx context.Context, repositoryId uint64, repoDir string,
 	return nil
 }
 
+// loadRepositoryFromIPFS loads a repository from IPFS into the local git directory
+func loadRepositoryFromIPFS(ctx context.Context, repoID uint64, gitDir string, ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager, gitopiaClient *gc.Client) error {
+	// Get packfile info from storage manager
+	packfileInfo := storageManager.GetPackfileInfo(repoID)
+	if packfileInfo == nil {
+		return errors.Errorf("packfile info not found for repository %d", repoID)
+	}
+
+	// Get repository info from Gitopia
+	repositoryResp, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+		Id: repoID,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to get repository %d info", repoID)
+	}
+
+	repository := repositoryResp.Repository
+	repoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repoID))
+
+	fmt.Printf("Loading repository %d (%s/%s) from IPFS (CID: %s)\n", repoID, repository.Owner.Id, repository.Name, packfileInfo.CID)
+
+	// Check if repository directory already exists
+	if _, err := os.Stat(repoDir); err == nil {
+		fmt.Printf("Repository directory %s already exists, removing it first\n", repoDir)
+		if err := os.RemoveAll(repoDir); err != nil {
+			return errors.Wrapf(err, "failed to remove existing repository directory %s", repoDir)
+		}
+	}
+
+	// Initialize bare repository
+	initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(initCtx, "git", "init", "--bare", repoDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to initialize repository %d: %s", repoID, string(output))
+	}
+
+	// Handle forked repository - load parent first and set up alternates
+	if repository.Fork {
+		fmt.Printf("Repository %d is a fork of %d, loading parent first\n", repoID, repository.Parent)
+
+		parentRepoDir := filepath.Join(gitDir, fmt.Sprintf("%d.git", repository.Parent))
+		if _, err := os.Stat(parentRepoDir); os.IsNotExist(err) {
+			// Recursively load parent repository
+			if err := loadRepositoryFromIPFS(ctx, repository.Parent, gitDir, ipfsClusterClient, storageManager, gitopiaClient); err != nil {
+				return errors.Wrapf(err, "failed to load parent repository %d", repository.Parent)
+			}
+		}
+
+		// Set up alternates for the fork
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+			return errors.Wrap(err, "failed to create alternates directory")
+		}
+		parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+		if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+			return errors.Wrap(err, "failed to create alternates file")
+		}
+		fmt.Printf("Created alternates file linking fork %d to parent %d\n", repoID, repository.Parent)
+	}
+
+	// Download packfile from IPFS
+	if err := downloadPackfileFromIPFS(packfileInfo.CID, packfileInfo.Name, repoDir); err != nil {
+		return errors.Wrapf(err, "failed to download packfile for repository %d", repoID)
+	}
+
+	// Run git gc to ensure repository is in good state
+	gcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	gcCmd := exec.CommandContext(gcCtx, "git", "gc")
+	gcCmd.Dir = repoDir
+	if output, err := gcCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "error running git gc for repo %d: %s", repoID, string(output))
+	}
+
+	fmt.Printf("Successfully loaded repository %d from IPFS into %s\n", repoID, repoDir)
+	return nil
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:               "clone-script",
@@ -719,6 +800,12 @@ func main() {
 			retryFailed, err := cmd.Flags().GetBool("retry-failed")
 			if err != nil {
 				return errors.Wrap(err, "failed to get retry-failed flag")
+			}
+
+			// Get the load-from-ipfs flag
+			loadFromIPFS, err := cmd.Flags().GetUint64("load-from-ipfs")
+			if err != nil {
+				return errors.Wrap(err, "failed to get load-from-ipfs flag")
 			}
 
 			// Create required directories
@@ -777,6 +864,12 @@ func main() {
 				log.Println("Pinata client initialized")
 			} else {
 				log.Println("Pinata JWT token not provided, skipping Pinata uploads")
+			}
+
+			// Handle load-from-ipfs mode
+			if loadFromIPFS > 0 {
+				fmt.Printf("Loading repository %d from IPFS into repo directory\n", loadFromIPFS)
+				return loadRepositoryFromIPFS(ctx, loadFromIPFS, gitDir, ipfsClusterClient, storageManager, &gitopiaClient)
 			}
 
 			// Process repositories only if not in releases-only mode
@@ -1025,6 +1118,7 @@ func main() {
 	rootCmd.Flags().String("keyring-backend", "", "Select keyring's backend (os|file|kwallet|pass|test|memory)")
 	rootCmd.Flags().Bool("releases-only", false, "Process only releases, skip repository cloning")
 	rootCmd.Flags().Bool("retry-failed", false, "Retry only failed repositories from progress file")
+	rootCmd.Flags().Uint64("load-from-ipfs", 0, "Load a specific repository from IPFS by repository ID")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
