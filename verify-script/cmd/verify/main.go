@@ -472,12 +472,20 @@ func retryFailedRepositories(ctx context.Context, gitopiaClient *gc.Client, stor
 		}
 
 		// Check if repository is empty
-		_, err = gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+		branchAllRes, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranchAll(ctx, &gitopiatypes.QueryAllRepositoryBranchRequest{
 			Id:             repo.Repository.Owner.Id,
 			RepositoryName: repo.Repository.Name,
-			BranchName:     repo.Repository.DefaultBranch,
+			Pagination: &query.PageRequest{
+				Limit: math.MaxUint64,
+			},
 		})
 		if err != nil {
+			fmt.Printf("failed to query branches: %v", err)
+			continue
+		}
+
+		// Skip repositories with no branches
+		if len(branchAllRes.Branch) == 0 {
 			fmt.Printf("Repository %d is empty, skipping\n", repoID)
 			continue
 		}
