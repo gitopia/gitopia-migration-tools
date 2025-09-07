@@ -545,7 +545,7 @@ func main() {
 	gc.WithTmAddr(viper.GetString("TM_ADDR"))
 	gc.WithWorkingDir(viper.GetString("WORKING_DIR"))
 
-	if err := rootCmd.Execute(); err != nil {
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
