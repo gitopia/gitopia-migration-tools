@@ -451,9 +451,7 @@ func retryFailedRepositories(ctx context.Context, gitopiaClient *gc.Client, stor
 	// Extract unique repository IDs from failures
 	failedRepoIDs := make(map[uint64]bool)
 	for _, failure := range log.Failures {
-		if failure.Error == "packfile not found in database" {
-			failedRepoIDs[failure.RepositoryID] = true
-		}
+		failedRepoIDs[failure.RepositoryID] = true
 	}
 
 	fmt.Printf("Found %d unique repositories with 'packfile not found in database' errors to retry\n", len(failedRepoIDs))
