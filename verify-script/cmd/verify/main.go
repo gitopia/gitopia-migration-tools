@@ -92,6 +92,7 @@ func (prm *ParentRepoManager) acquireParentRepo(ctx context.Context, parentRepoI
 
 	// If directory already exists, just return it
 	if _, err := os.Stat(parentRepoDir); err == nil {
+		fmt.Printf("Reusing existing parent repository directory for parent %d\n", parentRepoID)
 		return parentRepoDir, nil
 	}
 
@@ -208,6 +209,12 @@ func logVerificationFailure(log *VerificationLog, repoID uint64, refName, refSHA
 	log.mu.Unlock()
 }
 
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // fetchPackfileFromIPFS downloads a packfile from IPFS with efficient handling for large files
 func fetchPackfileFromIPFS(ctx context.Context, cid, packfileName, targetDir string) (string, error) {
 	// Create packfile directly in target directory
@@ -300,18 +307,23 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		return nil
 	}
 
-	// Create temporary repository directory
+	// Create temporary repository directory (reuse if exists)
 	repoDir := filepath.Join(tempDir, fmt.Sprintf("verify_%d.git", repoID))
-	if err := os.MkdirAll(repoDir, 0755); err != nil {
-		return errors.Wrap(err, "failed to create repository directory")
+	repoExists := false
+	if _, err := os.Stat(repoDir); err == nil {
+		repoExists = true
+		fmt.Printf("Reusing existing repository directory for repo %d\n", repoID)
+	} else {
+		if err := os.MkdirAll(repoDir, 0755); err != nil {
+			return errors.Wrap(err, "failed to create repository directory")
+		}
+		// Initialize bare repository only if it doesn't exist
+		initCmd := exec.CommandContext(ctx, "git", "init", "--bare", repoDir)
+		if output, err := initCmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "failed to initialize repository: %s", string(output))
+		}
 	}
 	// defer os.RemoveAll(repoDir)
-
-	// Initialize bare repository
-	initCmd := exec.CommandContext(ctx, "git", "init", "--bare", repoDir)
-	if output, err := initCmd.CombinedOutput(); err != nil {
-		return errors.Wrapf(err, "failed to initialize repository: %s", string(output))
-	}
 
 	// Handle fork repositories with alternates
 	var parentRepoDir string
@@ -329,14 +341,16 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 			}
 		}()
 
-		// Set up alternates file
+		// Set up alternates file (only if repo doesn't exist or alternates file is missing)
 		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
-		if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
-			return errors.Wrap(err, "failed to create alternates directory")
-		}
-		parentObjectsPath := filepath.Join(parentRepoDir, "objects")
-		if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
-			return errors.Wrap(err, "failed to create alternates file")
+		if !repoExists || !fileExists(alternatesPath) {
+			if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+				return errors.Wrap(err, "failed to create alternates directory")
+			}
+			parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+			if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+				return errors.Wrap(err, "failed to create alternates file")
+			}
 		}
 	}
 
@@ -361,18 +375,30 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 			return errors.Wrap(err, "failed to create pack directory")
 		}
 
-		// Fetch packfile directly to pack directory
-		packfilePath, err := fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
-		if err != nil {
-			logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
-			return nil
+		// Check if packfile already exists to avoid re-fetching
+		packfilePath := filepath.Join(packDir, packfileInfo.Name)
+		packfileExists := fileExists(packfilePath)
+		
+		if !packfileExists {
+			// Fetch packfile directly to pack directory
+			packfilePath, err = fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
+			if err != nil {
+				logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
+				return nil
+			}
+		} else {
+			fmt.Printf("Reusing existing packfile for repo %d\n", repoID)
 		}
 
-		indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
-		indexPackCmd.Dir = packDir
-		if output, err := indexPackCmd.CombinedOutput(); err != nil {
-			logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to index packfile: %v, output: %s", err, string(output)))
-			return nil
+		// Check if packfile is already indexed (look for .idx file)
+		idxPath := packfilePath[:len(packfilePath)-5] + ".idx" // Replace .pack with .idx
+		if !fileExists(idxPath) {
+			indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
+			indexPackCmd.Dir = packDir
+			if output, err := indexPackCmd.CombinedOutput(); err != nil {
+				logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to index packfile: %v, output: %s", err, string(output)))
+				return nil
+			}
 		}
 	}
 
