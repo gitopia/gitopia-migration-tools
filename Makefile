@@ -1,9 +1,9 @@
 # Gitopia Migration Tools Makefile
 
-.PHONY: all clean build-clone build-sync build-update install help
+.PHONY: all clean build-clone build-sync build-update build-verify install help
 
 # Default target
-all: build-clone build-sync build-update
+all: build-clone build-sync build-update build-verify
 
 # Build clone script
 build-clone:
@@ -20,12 +20,17 @@ build-update:
 	@echo "Building update script..."
 	cd update-script && go mod download && go build -o ../bin/update ./cmd/update
 
+# Build verify script
+build-verify:
+	@echo "Building verify script..."
+	cd verify-script && go mod download && go build -o ../bin/verify ./cmd/verify
+
 # Create bin directory
 bin:
 	mkdir -p bin
 
 # Build all components
-build: bin build-clone build-sync build-update
+build: bin build-clone build-sync build-update build-verify
 	@echo "All components built successfully!"
 
 # Install binaries to system PATH
@@ -34,6 +39,7 @@ install: build
 	sudo cp bin/clone /usr/local/bin/gitopia-clone
 	sudo cp bin/syncd /usr/local/bin/gitopia-syncd
 	sudo cp bin/update /usr/local/bin/gitopia-update
+	sudo cp bin/verify /usr/local/bin/gitopia-verify
 	@echo "Installation complete!"
 
 # Clean build artifacts
@@ -43,6 +49,7 @@ clean:
 	cd clone-script && go clean
 	cd sync-daemon && go clean
 	cd update-script && go clean
+	cd verify-script && go clean
 	@echo "Clean complete!"
 
 # Show help
@@ -55,6 +62,7 @@ help:
 	@echo "  build-clone  - Build only clone script"
 	@echo "  build-sync   - Build only sync daemon"
 	@echo "  build-update - Build only update script"
+	@echo "  build-verify - Build only verify script"
 	@echo "  install      - Install binaries to system PATH"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  help         - Show this help message"
@@ -63,3 +71,4 @@ help:
 	@echo "  clone-script/  - Clones repos and assets (gitopia v5.1.0)"
 	@echo "  sync-daemon/   - Syncs changes until upgrade (gitopia v5.1.0)"
 	@echo "  update-script/ - Updates blockchain after upgrade (gitopia v6.0.0-rc.6)"
+	@echo "  verify-script/ - Verifies IPFS packfiles contain all repository refs"
