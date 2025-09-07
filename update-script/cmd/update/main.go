@@ -204,6 +204,9 @@ func main() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
+			// Get flags
+			packfilesOnly, _ := cmd.Flags().GetBool("packfiles-only")
+
 			// Initialize storage manager
 			workingDir := viper.GetString("WORKING_DIR")
 			fmt.Printf("Using working directory: %s\n", workingDir)
@@ -230,7 +233,11 @@ func main() {
 			// Initialize batch transaction manager
 			batchMgr := NewBatchTxManager(gitopiaClient, BATCH_SIZE)
 
-			fmt.Printf("Starting batch update process with batch size: %d\n", BATCH_SIZE)
+			if packfilesOnly {
+				fmt.Printf("Starting packfiles-only update process with batch size: %d\n", BATCH_SIZE)
+			} else {
+				fmt.Printf("Starting batch update process with batch size: %d\n", BATCH_SIZE)
+			}
 
 			// Process repository packfiles
 			fmt.Println("Processing repository packfiles...")
@@ -238,16 +245,20 @@ func main() {
 				return errors.Wrap(err, "failed to process repository packfiles")
 			}
 
-			// Process release assets
-			fmt.Println("Processing release assets...")
-			if err := processReleaseAssets(ctx, batchMgr, storageManager); err != nil {
-				return errors.Wrap(err, "failed to process release assets")
-			}
+			if !packfilesOnly {
+				// Process release assets
+				fmt.Println("Processing release assets...")
+				if err := processReleaseAssets(ctx, batchMgr, storageManager); err != nil {
+					return errors.Wrap(err, "failed to process release assets")
+				}
 
-			// Process LFS objects
-			fmt.Println("Processing LFS objects...")
-			if err := processLFSObjects(ctx, batchMgr, storageManager); err != nil {
-				return errors.Wrap(err, "failed to process LFS objects")
+				// Process LFS objects
+				fmt.Println("Processing LFS objects...")
+				if err := processLFSObjects(ctx, batchMgr, storageManager); err != nil {
+					return errors.Wrap(err, "failed to process LFS objects")
+				}
+			} else {
+				fmt.Println("Skipping release assets and LFS objects (packfiles-only mode)")
 			}
 
 			// Flush any remaining messages in the batch
@@ -264,6 +275,7 @@ func main() {
 	// Add flags
 	rootCmd.Flags().String("from", "", "Name or address of private key with which to sign")
 	rootCmd.Flags().String("keyring-backend", "", "Select keyring's backend (os|file|kwallet|pass|test|memory)")
+	rootCmd.Flags().Bool("packfiles-only", false, "Process only repository packfiles, skip release assets and LFS objects")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
