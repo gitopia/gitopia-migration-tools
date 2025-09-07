@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/client/keys"
 	"github.com/cosmos/cosmos-sdk/client/tx"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/query"
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
 	"github.com/gitopia/gitopia-migration-tools/shared"
@@ -873,13 +875,19 @@ func updateRepository(ctx context.Context, repoID uint64, gitDir string, ipfsClu
 	fmt.Printf("Found repository: %s/%s (ID: %d)\n", repository.Owner.Id, repository.Name, repoID)
 
 	// Check if repository is empty
-	_, err = gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+	branchAllRes, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranchAll(ctx, &gitopiatypes.QueryAllRepositoryBranchRequest{
 		Id:             repository.Owner.Id,
 		RepositoryName: repository.Name,
-		BranchName:     repository.DefaultBranch,
+		Pagination: &query.PageRequest{
+			Limit: math.MaxUint64,
+		},
 	})
 	if err != nil {
-		return errors.Errorf("repository %d is empty or has no default branch", repoID)
+		return errors.Errorf("failed to query branches: %v", err)
+	}
+
+	if len(branchAllRes.Branch) == 0 {
+		return errors.Errorf("repository %d is empty", repoID)
 	}
 
 	// Get existing packfile info from database to unpin old one later
