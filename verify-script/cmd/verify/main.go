@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/tx"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/query"
 	gc "github.com/gitopia/gitopia-go"
 	"github.com/gitopia/gitopia-go/logger"
 	"github.com/gitopia/gitopia-migration-tools/shared"
@@ -42,7 +44,120 @@ type VerificationFailure struct {
 
 type VerificationLog struct {
 	Failures []VerificationFailure `json:"failures"`
-	mu       sync.Mutex             // Mutex for thread-safe access
+	mu       sync.Mutex            // Mutex for thread-safe access
+}
+
+// ParentRepoManager manages parent repository setup with race condition protection
+type ParentRepoManager struct {
+	setupMutexes map[uint64]*sync.Mutex // Per-parent-repo mutexes
+	refCounts    map[uint64]int         // Reference counts for cleanup
+	globalMutex  sync.Mutex             // Protects the maps above
+}
+
+func NewParentRepoManager() *ParentRepoManager {
+	return &ParentRepoManager{
+		setupMutexes: make(map[uint64]*sync.Mutex),
+		refCounts:    make(map[uint64]int),
+	}
+}
+
+// getOrCreateMutex returns the mutex for a parent repo, creating it if necessary
+func (prm *ParentRepoManager) getOrCreateMutex(parentRepoID uint64) *sync.Mutex {
+	prm.globalMutex.Lock()
+	defer prm.globalMutex.Unlock()
+
+	if mutex, exists := prm.setupMutexes[parentRepoID]; exists {
+		return mutex
+	}
+
+	mutex := &sync.Mutex{}
+	prm.setupMutexes[parentRepoID] = mutex
+	return mutex
+}
+
+// acquireParentRepo safely sets up a parent repository and increments reference count
+func (prm *ParentRepoManager) acquireParentRepo(ctx context.Context, parentRepoID uint64, tempDir string, storageManager *shared.StorageManager) (string, error) {
+	// Get the mutex for this specific parent repo
+	mutex := prm.getOrCreateMutex(parentRepoID)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	parentRepoDir := filepath.Join(tempDir, fmt.Sprintf("parent_%d.git", parentRepoID))
+
+	// Increment reference count
+	prm.globalMutex.Lock()
+	prm.refCounts[parentRepoID]++
+	refCount := prm.refCounts[parentRepoID]
+	prm.globalMutex.Unlock()
+
+	// If directory already exists, just return it
+	if _, err := os.Stat(parentRepoDir); err == nil {
+		return parentRepoDir, nil
+	}
+
+	// Setup the parent repository (only first worker will do this)
+	if refCount == 1 {
+		if err := prm.setupParentRepoInternal(ctx, parentRepoID, parentRepoDir, tempDir, storageManager); err != nil {
+			// Decrement ref count on failure
+			prm.globalMutex.Lock()
+			prm.refCounts[parentRepoID]--
+			if prm.refCounts[parentRepoID] == 0 {
+				delete(prm.refCounts, parentRepoID)
+			}
+			prm.globalMutex.Unlock()
+			return "", err
+		}
+	}
+
+	return parentRepoDir, nil
+}
+
+// releaseParentRepo decrements reference count (parent repo persists for reuse)
+func (prm *ParentRepoManager) releaseParentRepo(parentRepoID uint64, parentRepoDir string) {
+	prm.globalMutex.Lock()
+	defer prm.globalMutex.Unlock()
+
+	prm.refCounts[parentRepoID]--
+	if prm.refCounts[parentRepoID] <= 0 {
+		delete(prm.refCounts, parentRepoID)
+		// Parent repository directory is kept for future reuse
+	}
+}
+
+// setupParentRepoInternal does the actual parent repository setup
+func (prm *ParentRepoManager) setupParentRepoInternal(ctx context.Context, parentRepoID uint64, parentRepoDir, tempDir string, storageManager *shared.StorageManager) error {
+	// Get parent repository packfile info from database
+	parentPackfileInfo := storageManager.GetPackfileInfo(parentRepoID)
+	if parentPackfileInfo == nil {
+		return errors.Errorf("parent repository %d packfile not found in database", parentRepoID)
+	}
+
+	// Create parent repository directory
+	if err := os.MkdirAll(parentRepoDir, 0755); err != nil {
+		return errors.Wrap(err, "failed to create parent repository directory")
+	}
+
+	// Initialize bare repository
+	initCmd := exec.CommandContext(ctx, "git", "init", "--bare", parentRepoDir)
+	if output, err := initCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to initialize parent repository: %s", string(output))
+	}
+
+	// Fetch parent packfile from IPFS
+	parentPackfilePath, err := fetchPackfileFromIPFS(ctx, parentPackfileInfo.CID, tempDir)
+	if err != nil {
+		return errors.Wrapf(err, "failed to fetch parent packfile from IPFS")
+	}
+	defer os.Remove(parentPackfilePath)
+
+	// Import packfile into parent repository
+	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", parentPackfilePath)
+	indexPackCmd.Dir = filepath.Join(parentRepoDir, "objects", "pack")
+	if output, err := indexPackCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to index parent packfile: %s", string(output))
+	}
+
+	return nil
 }
 
 func loadVerificationLog() (*VerificationLog, error) {
@@ -134,48 +249,6 @@ func fetchPackfileFromIPFS(ctx context.Context, cid, tempDir string) (string, er
 	return packfilePath, nil
 }
 
-// setupParentRepository creates parent repository from IPFS packfile for fork verification
-func setupParentRepository(ctx context.Context, parentRepoID uint64, tempDir string, storageManager *shared.StorageManager) (string, error) {
-	// Get parent repository packfile info from database
-	parentPackfileInfo := storageManager.GetPackfileInfo(parentRepoID)
-	if parentPackfileInfo == nil {
-		return "", errors.Errorf("parent repository %d packfile not found in database", parentRepoID)
-	}
-
-	// Create parent repository directory
-	parentRepoDir := filepath.Join(tempDir, fmt.Sprintf("parent_%d.git", parentRepoID))
-	if err := os.MkdirAll(parentRepoDir, 0755); err != nil {
-		return "", errors.Wrap(err, "failed to create parent repository directory")
-	}
-
-	// Initialize bare repository
-	initCmd := exec.CommandContext(ctx, "git", "init", "--bare", parentRepoDir)
-	if output, err := initCmd.CombinedOutput(); err != nil {
-		return "", errors.Wrapf(err, "failed to initialize parent repository: %s", string(output))
-	}
-
-	// Fetch parent packfile from IPFS
-	parentPackfilePath, err := fetchPackfileFromIPFS(ctx, parentPackfileInfo.CID, tempDir)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to fetch parent packfile from IPFS")
-	}
-	defer os.Remove(parentPackfilePath)
-
-	// Import packfile into parent repository
-	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", "-v", "--stdin")
-	indexPackCmd.Dir = filepath.Join(parentRepoDir, "objects", "pack")
-	indexPackCmd.Stdin, err = os.Open(parentPackfilePath)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to open parent packfile")
-	}
-
-	if output, err := indexPackCmd.CombinedOutput(); err != nil {
-		return "", errors.Wrapf(err, "failed to index parent packfile: %s", string(output))
-	}
-
-	return parentRepoDir, nil
-}
-
 // VerificationJob represents a repository verification job
 type VerificationJob struct {
 	RepoID uint64
@@ -188,7 +261,7 @@ type VerificationResult struct {
 }
 
 // verifyRepository checks if all refs exist in the repository packfile
-func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Client, storageManager *shared.StorageManager, tempDir string, log *VerificationLog) error {
+func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Client, storageManager *shared.StorageManager, tempDir string, log *VerificationLog, parentRepoManager *ParentRepoManager) error {
 	// Skip repo 62771 due to 30GB size
 	if repoID == 62771 {
 		fmt.Printf("Skipping repository %d (30GB binary files)\n", repoID)
@@ -201,6 +274,24 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 	})
 	if err != nil {
 		// Repository might not exist, skip silently
+		return nil
+	}
+
+	// Query branches early to skip repositories with no branches
+	branchAllRes, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranchAll(ctx, &gitopiatypes.QueryAllRepositoryBranchRequest{
+		Id:             repo.Repository.Owner.Id,
+		RepositoryName: repo.Repository.Name,
+		Pagination: &query.PageRequest{
+			Limit: math.MaxUint64,
+		},
+	})
+	if err != nil {
+		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to query branches: %v", err))
+		return nil
+	}
+
+	// Skip repositories with no branches
+	if len(branchAllRes.Branch) == 0 {
 		return nil
 	}
 
@@ -226,13 +317,19 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 
 	// Handle fork repositories with alternates
 	var parentRepoDir string
+	var needsParentCleanup bool
 	if repo.Repository.Fork {
-		parentRepoDir, err = setupParentRepository(ctx, repo.Repository.Parent, tempDir, storageManager)
+		parentRepoDir, err = parentRepoManager.acquireParentRepo(ctx, repo.Repository.Parent, tempDir, storageManager)
 		if err != nil {
 			logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to setup parent repository: %v", err))
 			return nil
 		}
-		defer os.RemoveAll(parentRepoDir)
+		needsParentCleanup = true
+		defer func() {
+			if needsParentCleanup {
+				parentRepoManager.releaseParentRepo(repo.Repository.Parent, parentRepoDir)
+			}
+		}()
 
 		// Set up alternates file
 		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
@@ -259,32 +356,20 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		return errors.Wrap(err, "failed to create pack directory")
 	}
 
-	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", "-v", "--stdin")
+	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
 	indexPackCmd.Dir = packDir
-	indexPackCmd.Stdin, err = os.Open(packfilePath)
-	if err != nil {
-		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to open packfile: %v", err))
-		return nil
-	}
-
 	if output, err := indexPackCmd.CombinedOutput(); err != nil {
 		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to index packfile: %v, output: %s", err, string(output)))
 		return nil
 	}
 
-	// Query all branches and tags from Gitopia
-	branchAllRes, err := gitopiaClient.QueryClient().Gitopia.RepositoryBranchAll(ctx, &gitopiatypes.QueryAllRepositoryBranchRequest{
-		Id:             repo.Repository.Owner.Id,
-		RepositoryName: repo.Repository.Name,
-	})
-	if err != nil {
-		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to query branches: %v", err))
-		return nil
-	}
-
+	// Query tags from Gitopia
 	tagAllRes, err := gitopiaClient.QueryClient().Gitopia.RepositoryTagAll(ctx, &gitopiatypes.QueryAllRepositoryTagRequest{
 		Id:             repo.Repository.Owner.Id,
 		RepositoryName: repo.Repository.Name,
+		Pagination: &query.PageRequest{
+			Limit: math.MaxUint64,
+		},
 	})
 	if err != nil {
 		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to query tags: %v", err))
@@ -355,13 +440,16 @@ func main() {
 				return errors.Wrap(err, "failed to load verification log")
 			}
 
+			// Create parent repository manager for race condition protection
+			parentRepoManager := NewParentRepoManager()
+
 			ctx = context.Background()
 
 			const maxRepoID uint64 = 62973
 			// Get concurrency level from config, default to 10
 			concurrency := viper.GetInt("VERIFY_CONCURRENCY")
 			if concurrency <= 0 {
-				concurrency = 10
+				concurrency = 20
 			}
 
 			fmt.Printf("Starting verification of repositories 0 to %d with %d concurrent workers\n", maxRepoID, concurrency)
@@ -376,16 +464,9 @@ func main() {
 				wg.Add(1)
 				go func(workerID int) {
 					defer wg.Done()
-					// Create worker-specific temp directory
-					workerTempDir := filepath.Join(tempDir, fmt.Sprintf("worker_%d", workerID))
-					if err := os.MkdirAll(workerTempDir, 0755); err != nil {
-						fmt.Printf("Worker %d: failed to create temp directory: %v\n", workerID, err)
-						return
-					}
-					defer os.RemoveAll(workerTempDir)
 
 					for job := range jobs {
-						err := verifyRepository(ctx, job.RepoID, &gitopiaClient, storageManager, workerTempDir, verificationLog)
+						err := verifyRepository(ctx, job.RepoID, &gitopiaClient, storageManager, tempDir, verificationLog, parentRepoManager)
 						results <- VerificationResult{
 							RepoID: job.RepoID,
 							Error:  err,
