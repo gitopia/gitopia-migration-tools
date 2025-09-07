@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/keys"
@@ -74,18 +75,64 @@ func (btm *BatchTxManager) FlushBatch(ctx context.Context) error {
 	return btm.ProcessBatch(ctx)
 }
 
+// queryChainPackfile queries the packfile information from the chain
+func queryChainPackfile(ctx context.Context, client gc.Client, repositoryId uint64) (storagetypes.Packfile, error) {
+	resp, err := client.QueryClient().Storage.RepositoryPackfile(ctx, &storagetypes.QueryRepositoryPackfileRequest{
+		RepositoryId: repositoryId,
+	})
+	if err != nil {
+		return storagetypes.Packfile{}, err
+	}
+	return resp.Packfile, nil
+}
+
+// isPackfileNotFoundError checks if the error indicates packfile not found
+func isPackfileNotFoundError(err error) bool {
+	return strings.Contains(err.Error(), "packfile not found")
+}
+
 // processRepositoryPackfiles processes repository packfiles using stored data
+// with chain query optimization - only updates if CID differs or doesn't exist
 func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allPackfiles := storageManager.GetAllPackfileInfo()
-	
+
 	if allPackfiles == nil {
 		fmt.Println("No packfile data retrieved (could be empty or error)")
 		return nil
 	}
-	
+
 	fmt.Printf("Found %d packfiles to process\n", len(allPackfiles))
 
+	processed := 0
+	skipped := 0
+
 	for _, packfileInfo := range allPackfiles {
+		// Query packfile information from chain
+		chainPackfile, err := queryChainPackfile(ctx, batchMgr.client, packfileInfo.RepositoryID)
+		if err != nil {
+			// If packfile doesn't exist on chain, we should update it
+			if isPackfileNotFoundError(err) {
+				fmt.Printf("Packfile for repository %d not found on chain, will update\n", packfileInfo.RepositoryID)
+			} else {
+				fmt.Printf("Failed to query packfile for repo %d: %v, will attempt update\n", packfileInfo.RepositoryID, err)
+			}
+		} else {
+			// Compare CIDs
+			if chainPackfile.Cid == packfileInfo.CID {
+				fmt.Printf("Packfile for repository %d already up-to-date (CID: %s), skipping\n", packfileInfo.RepositoryID, packfileInfo.CID)
+				skipped++
+				continue
+			}
+			fmt.Printf("Packfile for repository %d needs update (chain CID: %s -> new CID: %s)\n",
+				packfileInfo.RepositoryID, chainPackfile.Cid, packfileInfo.CID)
+		}
+
+		// Create update message
+		oldCid := ""
+		if err == nil {
+			oldCid = chainPackfile.Cid
+		}
+
 		msg := &storagetypes.MsgUpdateRepositoryPackfile{
 			Creator:      batchMgr.client.Address().String(),
 			RepositoryId: packfileInfo.RepositoryID,
@@ -93,7 +140,7 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 			Cid:          packfileInfo.CID,
 			RootHash:     packfileInfo.RootHash,
 			Size_:        uint64(packfileInfo.Size),
-			OldCid:       "", // Empty for initial update
+			OldCid:       oldCid,
 		}
 
 		if err := batchMgr.AddToBatch(ctx, msg); err != nil {
@@ -102,20 +149,22 @@ func processRepositoryPackfiles(ctx context.Context, batchMgr *BatchTxManager, s
 		}
 
 		fmt.Printf("Added packfile update for repository %d to batch\n", packfileInfo.RepositoryID)
+		processed++
 	}
 
+	fmt.Printf("Packfile processing complete: %d processed, %d skipped\n", processed, skipped)
 	return nil
 }
 
 // processReleaseAssets processes release assets using stored data
 func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allReleaseAssets := storageManager.GetAllReleaseAssets()
-	
+
 	if allReleaseAssets == nil {
 		fmt.Println("No release asset data retrieved (could be empty or error)")
 		return nil
 	}
-	
+
 	fmt.Printf("Found %d release assets to process\n", len(allReleaseAssets))
 
 	// Group assets by repository and tag
@@ -164,12 +213,12 @@ func processReleaseAssets(ctx context.Context, batchMgr *BatchTxManager, storage
 // processLFSObjects processes LFS objects using stored data
 func processLFSObjects(ctx context.Context, batchMgr *BatchTxManager, storageManager *shared.StorageManager) error {
 	allLFSObjects := storageManager.GetAllLFSObjects()
-	
+
 	if allLFSObjects == nil {
 		fmt.Println("No LFS object data retrieved (could be empty or error)")
 		return nil
 	}
-	
+
 	fmt.Printf("Found %d LFS objects to process\n", len(allLFSObjects))
 
 	for _, lfsInfo := range allLFSObjects {
@@ -210,7 +259,7 @@ func main() {
 			// Initialize storage manager
 			workingDir := viper.GetString("WORKING_DIR")
 			fmt.Printf("Using working directory: %s\n", workingDir)
-			
+
 			storageManager := shared.NewStorageManager(workingDir)
 			if err := storageManager.Load(); err != nil {
 				return errors.Wrap(err, "failed to load storage manager")
