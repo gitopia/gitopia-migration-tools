@@ -143,15 +143,21 @@ func (prm *ParentRepoManager) setupParentRepoInternal(ctx context.Context, paren
 		return errors.Wrapf(err, "failed to initialize parent repository: %s", string(output))
 	}
 
-	// Fetch parent packfile from IPFS
-	parentPackfilePath, err := fetchPackfileFromIPFS(ctx, parentPackfileInfo.CID, tempDir)
+	// Create parent pack directory
+	parentPackDir := filepath.Join(parentRepoDir, "objects", "pack")
+	if err := os.MkdirAll(parentPackDir, 0755); err != nil {
+		return errors.Wrap(err, "failed to create parent pack directory")
+	}
+
+	// Fetch parent packfile directly to pack directory
+	parentPackfilePath, err := fetchPackfileFromIPFS(ctx, parentPackfileInfo.CID, parentPackfileInfo.Name, parentPackDir)
 	if err != nil {
 		return errors.Wrapf(err, "failed to fetch parent packfile from IPFS")
 	}
 
 	// Import packfile into parent repository
 	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", parentPackfilePath)
-	indexPackCmd.Dir = filepath.Join(parentRepoDir, "objects", "pack")
+	indexPackCmd.Dir = parentPackDir
 	if output, err := indexPackCmd.CombinedOutput(); err != nil {
 		return errors.Wrapf(err, "failed to index parent packfile: %s", string(output))
 	}
@@ -203,9 +209,9 @@ func logVerificationFailure(log *VerificationLog, repoID uint64, refName, refSHA
 }
 
 // fetchPackfileFromIPFS downloads a packfile from IPFS with efficient handling for large files
-func fetchPackfileFromIPFS(ctx context.Context, cid, tempDir string) (string, error) {
-	// Create temporary file for the packfile
-	packfilePath := filepath.Join(tempDir, fmt.Sprintf("packfile_%s.pack", cid))
+func fetchPackfileFromIPFS(ctx context.Context, cid, packfileName, targetDir string) (string, error) {
+	// Create packfile directly in target directory
+	packfilePath := filepath.Join(targetDir, packfileName)
 
 	// Use IPFS HTTP API to fetch the file with streaming
 	ipfsURL := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=%s",
@@ -341,18 +347,17 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		}
 	}
 
-	// Fetch packfile from IPFS
-	packfilePath, err := fetchPackfileFromIPFS(ctx, packfileInfo.CID, tempDir)
-	if err != nil {
-		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
-		return nil
-	}
-	// defer os.Remove(packfilePath)
-
-	// Import packfile into repository
+	// Create pack directory
 	packDir := filepath.Join(repoDir, "objects", "pack")
 	if err := os.MkdirAll(packDir, 0755); err != nil {
 		return errors.Wrap(err, "failed to create pack directory")
+	}
+
+	// Fetch packfile directly to pack directory
+	packfilePath, err := fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
+	if err != nil {
+		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
+		return nil
 	}
 
 	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
