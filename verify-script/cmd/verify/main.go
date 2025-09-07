@@ -300,13 +300,6 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		return nil
 	}
 
-	// Get packfile info from database
-	packfileInfo := storageManager.GetPackfileInfo(repoID)
-	if packfileInfo == nil {
-		logVerificationFailure(log, repoID, "", "", "packfile not found in database")
-		return nil
-	}
-
 	// Create temporary repository directory
 	repoDir := filepath.Join(tempDir, fmt.Sprintf("verify_%d.git", repoID))
 	if err := os.MkdirAll(repoDir, 0755); err != nil {
@@ -347,24 +340,40 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		}
 	}
 
-	// Create pack directory
-	packDir := filepath.Join(repoDir, "objects", "pack")
-	if err := os.MkdirAll(packDir, 0755); err != nil {
-		return errors.Wrap(err, "failed to create pack directory")
-	}
+	// Get packfile info from database
+	packfileInfo := storageManager.GetPackfileInfo(repoID)
+	
+	// Handle case where fork repositories have no packfile of their own
+	if packfileInfo == nil {
+		if repo.Repository.Fork {
+			// For fork repositories, it's expected that some may have no packfile
+			// They rely entirely on parent repository objects via alternates
+			fmt.Printf("Fork repository %d has no packfile (uses parent objects only)\n", repoID)
+		} else {
+			// For non-fork repositories, missing packfile is an error
+			logVerificationFailure(log, repoID, "", "", "packfile not found in database")
+			return nil
+		}
+	} else {
+		// Create pack directory and fetch packfile if it exists
+		packDir := filepath.Join(repoDir, "objects", "pack")
+		if err := os.MkdirAll(packDir, 0755); err != nil {
+			return errors.Wrap(err, "failed to create pack directory")
+		}
 
-	// Fetch packfile directly to pack directory
-	packfilePath, err := fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
-	if err != nil {
-		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
-		return nil
-	}
+		// Fetch packfile directly to pack directory
+		packfilePath, err := fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
+		if err != nil {
+			logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
+			return nil
+		}
 
-	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
-	indexPackCmd.Dir = packDir
-	if output, err := indexPackCmd.CombinedOutput(); err != nil {
-		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to index packfile: %v, output: %s", err, string(output)))
-		return nil
+		indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", packfilePath)
+		indexPackCmd.Dir = packDir
+		if output, err := indexPackCmd.CombinedOutput(); err != nil {
+			logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to index packfile: %v, output: %s", err, string(output)))
+			return nil
+		}
 	}
 
 	// Query tags from Gitopia
