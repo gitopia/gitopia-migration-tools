@@ -148,7 +148,6 @@ func (prm *ParentRepoManager) setupParentRepoInternal(ctx context.Context, paren
 	if err != nil {
 		return errors.Wrapf(err, "failed to fetch parent packfile from IPFS")
 	}
-	defer os.Remove(parentPackfilePath)
 
 	// Import packfile into parent repository
 	indexPackCmd := exec.CommandContext(ctx, "git", "index-pack", parentPackfilePath)
@@ -307,7 +306,7 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 	if err := os.MkdirAll(repoDir, 0755); err != nil {
 		return errors.Wrap(err, "failed to create repository directory")
 	}
-	defer os.RemoveAll(repoDir)
+	// defer os.RemoveAll(repoDir)
 
 	// Initialize bare repository
 	initCmd := exec.CommandContext(ctx, "git", "init", "--bare", repoDir)
@@ -348,7 +347,7 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		logVerificationFailure(log, repoID, "", "", fmt.Sprintf("failed to fetch packfile from IPFS: %v", err))
 		return nil
 	}
-	defer os.Remove(packfilePath)
+	// defer os.Remove(packfilePath)
 
 	// Import packfile into repository
 	packDir := filepath.Join(repoDir, "objects", "pack")
@@ -432,7 +431,7 @@ func main() {
 			if err := os.MkdirAll(tempDir, 0755); err != nil {
 				return errors.Wrap(err, "failed to create temp directory")
 			}
-			defer os.RemoveAll(tempDir)
+			// defer os.RemoveAll(tempDir)
 
 			// Load verification log
 			verificationLog, err := loadVerificationLog()
