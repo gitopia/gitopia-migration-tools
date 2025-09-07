@@ -22,6 +22,7 @@ import (
 	"github.com/gitopia/gitopia-go/logger"
 	"github.com/gitopia/gitopia-migration-tools/shared"
 	gitopiatypes "github.com/gitopia/gitopia/v6/x/gitopia/types"
+	ipfsclusterclient "github.com/ipfs-cluster/ipfs-cluster/api/rest/client"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -356,7 +357,7 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 
 	// Get packfile info from database
 	packfileInfo := storageManager.GetPackfileInfo(repoID)
-	
+
 	// Handle case where fork repositories have no packfile of their own
 	if packfileInfo == nil {
 		if repo.Repository.Fork {
@@ -378,7 +379,7 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 		// Check if packfile already exists to avoid re-fetching
 		packfilePath := filepath.Join(packDir, packfileInfo.Name)
 		packfileExists := fileExists(packfilePath)
-		
+
 		if !packfileExists {
 			// Fetch packfile directly to pack directory
 			packfilePath, err = fetchPackfileFromIPFS(ctx, packfileInfo.CID, packfileInfo.Name, packDir)
@@ -436,6 +437,260 @@ func verifyRepository(ctx context.Context, repoID uint64, gitopiaClient *gc.Clie
 	return nil
 }
 
+// retryFailedRepositories processes repositories that failed verification by cloning and pinning them
+func retryFailedRepositories(ctx context.Context, gitopiaClient *gc.Client, storageManager *shared.StorageManager,
+	ipfsClusterClient ipfsclusterclient.Client, pinataClient *shared.PinataClient, tempDir string,
+	parentRepoManager *ParentRepoManager, log *VerificationLog) error {
+
+	// Load current verification failures
+	if len(log.Failures) == 0 {
+		fmt.Println("No verification failures found to retry")
+		return nil
+	}
+
+	// Extract unique repository IDs from failures
+	failedRepoIDs := make(map[uint64]bool)
+	for _, failure := range log.Failures {
+		if failure.Error == "packfile not found in database" {
+			failedRepoIDs[failure.RepositoryID] = true
+		}
+	}
+
+	fmt.Printf("Found %d unique repositories with 'packfile not found in database' errors to retry\n", len(failedRepoIDs))
+
+	successCount := 0
+	for repoID := range failedRepoIDs {
+		fmt.Printf("Retrying repository %d...\n", repoID)
+
+		// Get repository info from Gitopia
+		repo, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+			Id: repoID,
+		})
+		if err != nil {
+			fmt.Printf("Repository %d not found, skipping: %v\n", repoID, err)
+			continue
+		}
+
+		// Check if repository is empty
+		_, err = gitopiaClient.QueryClient().Gitopia.RepositoryBranch(ctx, &gitopiatypes.QueryGetRepositoryBranchRequest{
+			Id:             repo.Repository.Owner.Id,
+			RepositoryName: repo.Repository.Name,
+			BranchName:     repo.Repository.DefaultBranch,
+		})
+		if err != nil {
+			fmt.Printf("Repository %d is empty, skipping\n", repoID)
+			continue
+		}
+
+		// Clone and process the repository
+		if err := cloneAndProcessRepository(ctx, repo.Repository, tempDir, ipfsClusterClient, storageManager, gitopiaClient, pinataClient, parentRepoManager); err != nil {
+			fmt.Printf("Failed to clone and process repository %d: %v\n", repoID, err)
+			continue
+		}
+
+		// Remove all failures for this repository from the log
+		removeRepositoryFromFailures(log, repoID)
+		successCount++
+		fmt.Printf("Successfully processed repository %d\n", repoID)
+	}
+
+	fmt.Printf("Retry complete: %d repositories successfully processed\n", successCount)
+	return nil
+}
+
+// removeRepositoryFromFailures removes all failure entries for a specific repository
+func removeRepositoryFromFailures(log *VerificationLog, repoID uint64) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+
+	newFailures := make([]VerificationFailure, 0)
+	for _, failure := range log.Failures {
+		if failure.RepositoryID != repoID {
+			newFailures = append(newFailures, failure)
+		}
+	}
+	log.Failures = newFailures
+}
+
+// cloneAndProcessRepository clones a repository and processes it like the clone script
+func cloneAndProcessRepository(ctx context.Context, repository *gitopiatypes.Repository, tempDir string,
+	ipfsClusterClient ipfsclusterclient.Client, storageManager *shared.StorageManager,
+	gitopiaClient *gc.Client, pinataClient *shared.PinataClient, parentRepoManager *ParentRepoManager) error {
+
+	repoID := repository.Id
+	repoDir := filepath.Join(tempDir, fmt.Sprintf("retry_%d.git", repoID))
+	remoteUrl := fmt.Sprintf("gitopia://%s/%s", repository.Owner.Id, repository.Name)
+
+	// Clean up any existing directory
+	if _, err := os.Stat(repoDir); err == nil {
+		if err := os.RemoveAll(repoDir); err != nil {
+			return errors.Wrapf(err, "failed to remove existing directory %s", repoDir)
+		}
+	}
+
+	// Handle forked repository optimization
+	if repository.Fork {
+		fmt.Printf("Repository %d is a fork of %d, setting up optimized clone with alternates\n", repoID, repository.Parent)
+
+		// Ensure parent repository is available
+		parentRepoDir, err := parentRepoManager.acquireParentRepo(ctx, repository.Parent, tempDir, storageManager)
+		if err != nil {
+			return errors.Wrapf(err, "failed to setup parent repository %d for fork %d", repository.Parent, repoID)
+		}
+		defer parentRepoManager.releaseParentRepo(repository.Parent, parentRepoDir)
+
+		// Clone fork with alternates optimization
+		if err := cloneForkWithAlternates(ctx, remoteUrl, repoDir, parentRepoDir, repository.Parent); err != nil {
+			return errors.Wrapf(err, "error cloning forked repository %d with alternates", repoID)
+		}
+	} else {
+		// Standard clone for non-forked repositories
+		cloneCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+
+		cmd := exec.CommandContext(cloneCtx, "git", "clone", "--bare", "--mirror", remoteUrl, repoDir)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "error cloning repository %d: %s", repoID, string(output))
+		}
+	}
+
+	// Run git gc
+	gcCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	gcCmd := exec.CommandContext(gcCtx, "git", "gc")
+	gcCmd.Dir = repoDir
+	if output, err := gcCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "error running git gc for repo %d: %s", repoID, string(output))
+	}
+
+	// For forked repos with alternates, run git repack to remove common objects
+	if repository.Fork {
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if _, err := os.Stat(alternatesPath); err == nil {
+			fmt.Printf("Running git repack to optimize forked repository %d\n", repoID)
+
+			repackCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+			defer cancel()
+
+			repackCmd := exec.CommandContext(repackCtx, "git", "repack", "-a", "-d", "-l")
+			repackCmd.Dir = repoDir
+			if output, err := repackCmd.CombinedOutput(); err != nil {
+				fmt.Printf("Warning: git repack failed for forked repo %d: %v\nOutput: %s\n", repoID, err, string(output))
+			}
+		}
+	}
+
+	// Pin packfile to IPFS cluster
+	packDir := filepath.Join(repoDir, "objects", "pack")
+	packFiles, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
+	if err != nil {
+		return errors.Wrapf(err, "error finding packfiles for repo %d", repoID)
+	}
+
+	if len(packFiles) > 0 {
+		packfileName := packFiles[0]
+		cid, err := shared.PinFile(ipfsClusterClient, packfileName)
+		if err != nil {
+			return errors.Wrapf(err, "error pinning packfile for repo %d", repoID)
+		}
+
+		rootHash, size, err := shared.ComputeFileInfo(packfileName, cid)
+		if err != nil {
+			return errors.Wrapf(err, "error computing file info for packfile repo %d", repoID)
+		}
+
+		packfileInfo := &shared.PackfileInfo{
+			RepositoryID: repoID,
+			Name:         filepath.Base(packfileName),
+			CID:          cid,
+			RootHash:     rootHash,
+			Size:         size,
+			UpdatedAt:    time.Now(),
+			UpdatedBy:    "verify-retry",
+		}
+		storageManager.SetPackfileInfo(packfileInfo)
+		fmt.Printf("Successfully pinned packfile for repository %d (CID: %s)\n", repoID, cid)
+
+		// Pin to Pinata if enabled
+		if pinataClient != nil {
+			resp, err := pinataClient.PinFile(ctx, packfileName, filepath.Base(packfileName))
+			if err != nil {
+				fmt.Printf("Warning: failed to pin packfile to Pinata for repo %d: %v\n", repoID, err)
+			} else {
+				fmt.Printf("Successfully pinned packfile to Pinata for repository %d (Pinata ID: %s)\n", repoID, resp.Data.ID)
+			}
+		}
+	} else if repository.Fork {
+		fmt.Printf("Forked repository %d has no packfile (no new changes), using parent objects via alternates\n", repoID)
+	}
+
+	// Clean up repository directory
+	if err := os.RemoveAll(repoDir); err != nil {
+		fmt.Printf("Warning: failed to delete repository directory %s: %v\n", repoDir, err)
+	}
+
+	// Save storage manager state
+	if err := storageManager.Save(); err != nil {
+		return errors.Wrap(err, "failed to save storage manager")
+	}
+
+	return nil
+}
+
+// cloneForkWithAlternates performs an optimized clone of a forked repository using Git alternates
+func cloneForkWithAlternates(ctx context.Context, remoteUrl, repoDir, parentRepoDir string, parentRepoID uint64) error {
+	// Create the repository directory structure
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		return errors.Wrap(err, "failed to create repository directory")
+	}
+
+	// Initialize bare repository
+	initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	initCmd := exec.CommandContext(initCtx, "git", "init", "--bare", repoDir)
+	if output, err := initCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to initialize bare repository: %s", string(output))
+	}
+
+	// Set up alternates file BEFORE adding remote and fetching
+	if _, err := os.Stat(parentRepoDir); err == nil {
+		alternatesPath := filepath.Join(repoDir, "objects", "info", "alternates")
+		if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+			return errors.Wrap(err, "failed to create alternates directory")
+		}
+		parentObjectsPath := filepath.Join(parentRepoDir, "objects")
+		if err := os.WriteFile(alternatesPath, []byte(parentObjectsPath+"\n"), 0644); err != nil {
+			return errors.Wrap(err, "failed to create alternates file")
+		}
+		fmt.Printf("Created alternates file linking to parent repository %d before fetching\n", parentRepoID)
+	}
+
+	// Add remote origin
+	addRemoteCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	addRemoteCmd := exec.CommandContext(addRemoteCtx, "git", "remote", "add", "origin", remoteUrl)
+	addRemoteCmd.Dir = repoDir
+	if output, err := addRemoteCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to add remote origin: %s", string(output))
+	}
+
+	// Fetch all refs with alternates optimization (should only fetch new objects)
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	fetchCmd := exec.CommandContext(fetchCtx, "git", "fetch", "origin", "+refs/*:refs/*")
+	fetchCmd.Dir = repoDir
+	if output, err := fetchCmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "failed to fetch from origin with alternates: %s", string(output))
+	}
+
+	fmt.Printf("Successfully cloned fork with alternates optimization - only fetched unique objects\n")
+	return nil
+}
+
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:               "verify",
@@ -445,6 +700,11 @@ func main() {
 			return gc.CommandInit(cmd, AppName)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Get the retry-failed flag
+			retryFailed, err := cmd.Flags().GetBool("retry-failed")
+			if err != nil {
+				return errors.Wrap(err, "failed to get retry-failed flag")
+			}
 
 			// Initialize storage manager
 			storageManager := shared.NewStorageManager(viper.GetString("WORKING_DIR"))
@@ -466,6 +726,27 @@ func main() {
 			}
 			defer gitopiaClient.Close()
 
+			// Initialize IPFS cluster client
+			ipfsCfg := &ipfsclusterclient.Config{
+				Host:    viper.GetString("IPFS_CLUSTER_PEER_HOST"),
+				Port:    viper.GetString("IPFS_CLUSTER_PEER_PORT"),
+				Timeout: time.Minute * 5,
+			}
+			ipfsClusterClient, err := ipfsclusterclient.NewDefaultClient(ipfsCfg)
+			if err != nil {
+				return errors.Wrap(err, "failed to create IPFS cluster client")
+			}
+
+			// Initialize Pinata client if JWT token is provided
+			var pinataClient *shared.PinataClient
+			pinataJWT := viper.GetString("PINATA_JWT_TOKEN")
+			if pinataJWT != "" {
+				pinataClient = shared.NewPinataClient(pinataJWT)
+				log.Println("Pinata client initialized")
+			} else {
+				log.Println("Pinata JWT token not provided, skipping Pinata uploads")
+			}
+
 			// Create temporary directory for verification
 			tempDir := filepath.Join(viper.GetString("WORKING_DIR"), "verify_temp")
 			if err := os.MkdirAll(tempDir, 0755); err != nil {
@@ -481,6 +762,12 @@ func main() {
 
 			// Create parent repository manager for race condition protection
 			parentRepoManager := NewParentRepoManager()
+
+			// Handle retry-failed mode
+			if retryFailed {
+				fmt.Println("Starting retry of failed repositories from verification log")
+				return retryFailedRepositories(ctx, &gitopiaClient, storageManager, ipfsClusterClient, pinataClient, tempDir, parentRepoManager, verificationLog)
+			}
 
 			ctx = context.Background()
 
@@ -564,6 +851,9 @@ func main() {
 			return nil
 		},
 	}
+
+	// Add flags
+	rootCmd.Flags().Bool("retry-failed", false, "Retry cloning repositories that failed verification")
 
 	conf := sdk.GetConfig()
 	conf.SetBech32PrefixForAccount(AccountAddressPrefix, AccountPubKeyPrefix)
