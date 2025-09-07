@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -449,15 +450,24 @@ func retryFailedRepositories(ctx context.Context, gitopiaClient *gc.Client, stor
 	}
 
 	// Extract unique repository IDs from failures
-	failedRepoIDs := make(map[uint64]bool)
+	failedRepoIDsMap := make(map[uint64]bool)
 	for _, failure := range log.Failures {
-		failedRepoIDs[failure.RepositoryID] = true
+		failedRepoIDsMap[failure.RepositoryID] = true
 	}
+
+	// Convert to slice and sort by repository ID
+	failedRepoIDs := make([]uint64, 0, len(failedRepoIDsMap))
+	for repoID := range failedRepoIDsMap {
+		failedRepoIDs = append(failedRepoIDs, repoID)
+	}
+	sort.Slice(failedRepoIDs, func(i, j int) bool {
+		return failedRepoIDs[i] < failedRepoIDs[j]
+	})
 
 	fmt.Printf("Found %d unique repositories with 'packfile not found in database' errors to retry\n", len(failedRepoIDs))
 
 	successCount := 0
-	for repoID := range failedRepoIDs {
+	for _, repoID := range failedRepoIDs {
 		fmt.Printf("Retrying repository %d...\n", repoID)
 
 		// Get repository info from Gitopia
