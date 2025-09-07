@@ -51,15 +51,17 @@ type VerificationLog struct {
 
 // ParentRepoManager manages parent repository setup with race condition protection
 type ParentRepoManager struct {
-	setupMutexes map[uint64]*sync.Mutex // Per-parent-repo mutexes
-	refCounts    map[uint64]int         // Reference counts for cleanup
-	globalMutex  sync.Mutex             // Protects the maps above
+	setupMutexes  map[uint64]*sync.Mutex // Per-parent-repo mutexes
+	refCounts     map[uint64]int         // Reference counts for cleanup
+	globalMutex   sync.Mutex             // Protects the maps above
+	gitopiaClient *gc.Client             // Gitopia client for querying repository info
 }
 
-func NewParentRepoManager() *ParentRepoManager {
+func NewParentRepoManager(gitopiaClient *gc.Client) *ParentRepoManager {
 	return &ParentRepoManager{
-		setupMutexes: make(map[uint64]*sync.Mutex),
-		refCounts:    make(map[uint64]int),
+		setupMutexes:  make(map[uint64]*sync.Mutex),
+		refCounts:     make(map[uint64]int),
+		gitopiaClient: gitopiaClient,
 	}
 }
 
@@ -75,6 +77,14 @@ func (prm *ParentRepoManager) getOrCreateMutex(parentRepoID uint64) *sync.Mutex 
 	mutex := &sync.Mutex{}
 	prm.setupMutexes[parentRepoID] = mutex
 	return mutex
+}
+
+// getGitopiaClient returns the Gitopia client
+func (prm *ParentRepoManager) getGitopiaClient(ctx context.Context) (*gc.Client, error) {
+	if prm.gitopiaClient == nil {
+		return nil, errors.New("Gitopia client not initialized")
+	}
+	return prm.gitopiaClient, nil
 }
 
 // acquireParentRepo safely sets up a parent repository and increments reference count
@@ -127,12 +137,19 @@ func (prm *ParentRepoManager) releaseParentRepo(parentRepoID uint64, parentRepoD
 	}
 }
 
-// setupParentRepoInternal does the actual parent repository setup
+// setupParentRepoInternal does the actual parent repository setup with support for nested forks
 func (prm *ParentRepoManager) setupParentRepoInternal(ctx context.Context, parentRepoID uint64, parentRepoDir, tempDir string, storageManager *shared.StorageManager) error {
-	// Get parent repository packfile info from database
-	parentPackfileInfo := storageManager.GetPackfileInfo(parentRepoID)
-	if parentPackfileInfo == nil {
-		return errors.Errorf("parent repository %d packfile not found in database", parentRepoID)
+	// Get parent repository info from Gitopia to check if it's also a fork
+	gitopiaClient, err := prm.getGitopiaClient(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get Gitopia client")
+	}
+
+	parentRepo, err := gitopiaClient.QueryClient().Gitopia.Repository(ctx, &gitopiatypes.QueryGetRepositoryRequest{
+		Id: parentRepoID,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to query parent repository %d", parentRepoID)
 	}
 
 	// Create parent repository directory
@@ -144,6 +161,41 @@ func (prm *ParentRepoManager) setupParentRepoInternal(ctx context.Context, paren
 	initCmd := exec.CommandContext(ctx, "git", "init", "--bare", parentRepoDir)
 	if output, err := initCmd.CombinedOutput(); err != nil {
 		return errors.Wrapf(err, "failed to initialize parent repository: %s", string(output))
+	}
+
+	// If parent is also a fork, set up its parent first (recursive)
+	if parentRepo.Repository.Fork {
+		grandParentRepoID := parentRepo.Repository.Parent
+		fmt.Printf("Parent repository %d is also a fork of %d, setting up nested alternates\n", parentRepoID, grandParentRepoID)
+		
+		// Recursively acquire the grandparent repository
+		grandParentRepoDir, err := prm.acquireParentRepo(ctx, grandParentRepoID, tempDir, storageManager)
+		if err != nil {
+			return errors.Wrapf(err, "failed to setup grandparent repository %d for parent %d", grandParentRepoID, parentRepoID)
+		}
+		// Note: We don't defer release here as the parent repo will manage its own lifecycle
+		
+		// Set up alternates file for parent to point to grandparent
+		alternatesPath := filepath.Join(parentRepoDir, "objects", "info", "alternates")
+		if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err != nil {
+			return errors.Wrap(err, "failed to create parent alternates directory")
+		}
+		grandParentObjectsPath := filepath.Join(grandParentRepoDir, "objects")
+		if err := os.WriteFile(alternatesPath, []byte(grandParentObjectsPath+"\n"), 0644); err != nil {
+			return errors.Wrap(err, "failed to create parent alternates file")
+		}
+		fmt.Printf("Created alternates file for parent %d pointing to grandparent %d\n", parentRepoID, grandParentRepoID)
+	}
+
+	// Get parent repository packfile info from database
+	parentPackfileInfo := storageManager.GetPackfileInfo(parentRepoID)
+	if parentPackfileInfo == nil {
+		// If parent is a fork and has no packfile, it might rely entirely on its parent
+		if parentRepo.Repository.Fork {
+			fmt.Printf("Parent repository %d has no packfile (uses grandparent objects only)\n", parentRepoID)
+			return nil // This is okay for nested forks
+		}
+		return errors.Errorf("parent repository %d packfile not found in database", parentRepoID)
 	}
 
 	// Create parent pack directory
@@ -548,7 +600,7 @@ func cloneAndProcessRepository(ctx context.Context, repository *gitopiatypes.Rep
 	if repository.Fork {
 		fmt.Printf("Repository %d is a fork of %d, setting up optimized clone with alternates\n", repoID, repository.Parent)
 
-		// Ensure parent repository is available
+		// Ensure parent repository is available (handles nested forks automatically)
 		parentRepoDir, err := parentRepoManager.acquireParentRepo(ctx, repository.Parent, tempDir, storageManager)
 		if err != nil {
 			return errors.Wrapf(err, "failed to setup parent repository %d for fork %d", repository.Parent, repoID)
@@ -777,7 +829,7 @@ func main() {
 			}
 
 			// Create parent repository manager for race condition protection
-			parentRepoManager := NewParentRepoManager()
+			parentRepoManager := NewParentRepoManager(&gitopiaClient)
 
 			// Handle retry-failed mode
 			if retryFailed {
