@@ -149,7 +149,7 @@ func NewIPFSClient(host, port string) *IPFSClient {
 }
 
 func (ic *IPFSClient) DownloadFile(ctx context.Context, cid, outputPath string) error {
-	url := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=%s", ic.host, ic.port, cid)
+	url := fmt.Sprintf("http://%s:%s/api/v0/cat?arg=/ipfs/%s&progress=false", ic.host, ic.port, cid)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
