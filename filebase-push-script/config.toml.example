@@ -1,0 +1,20 @@
+# Filebase Push Script Configuration
+# Copy this file to config.toml and update the values
+
+# Gitopia Network Configuration
+GITOPIA_ADDR = "gitopia-grpc.polkachu.com:11390"
+TM_ADDR = "https://gitopia-rpc.polkachu.com:443"
+CHAIN_ID = "gitopia"
+GAS_PRICES = "0.001ulore"
+WORKING_DIR = "/app"
+
+# IPFS Configuration (Local IPFS server)
+IPFS_HOST = "localhost"
+IPFS_PORT = "5001"
+
+# Filebase Configuration
+FILEBASE_ACCESS_KEY = "your_filebase_access_key"
+FILEBASE_SECRET_KEY = "your_filebase_secret_key"
+FILEBASE_BUCKET = "your_filebase_bucket_name"
+FILEBASE_REGION = "us-east-1"
+FILEBASE_ENDPOINT = "https://s3.filebase.com"
