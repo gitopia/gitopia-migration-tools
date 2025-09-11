@@ -1,9 +1,9 @@
 # Gitopia Migration Tools Makefile
 
-.PHONY: all clean build-clone build-sync build-update build-verify install help
+.PHONY: all clean build-clone build-sync build-update build-verify build-filebase install help
 
 # Default target
-all: build-clone build-sync build-update build-verify
+all: build-clone build-sync build-update build-verify build-filebase
 
 # Build clone script
 build-clone:
@@ -25,12 +25,17 @@ build-verify:
 	@echo "Building verify script..."
 	cd verify-script && go mod download && go build -o ../bin/verify ./cmd/verify
 
+# Build filebase push script
+build-filebase:
+	@echo "Building filebase push script..."
+	cd filebase-push-script && go mod download && go build -o ../bin/filebase-push ./cmd/push
+
 # Create bin directory
 bin:
 	mkdir -p bin
 
 # Build all components
-build: bin build-clone build-sync build-update build-verify
+build: bin build-clone build-sync build-update build-verify build-filebase
 	@echo "All components built successfully!"
 
 # Install binaries to system PATH
@@ -40,6 +45,7 @@ install: build
 	sudo cp bin/syncd /usr/local/bin/gitopia-syncd
 	sudo cp bin/update /usr/local/bin/gitopia-update
 	sudo cp bin/verify /usr/local/bin/gitopia-verify
+	sudo cp bin/filebase-push /usr/local/bin/gitopia-filebase-push
 	@echo "Installation complete!"
 
 # Clean build artifacts
@@ -50,6 +56,7 @@ clean:
 	cd sync-daemon && go clean
 	cd update-script && go clean
 	cd verify-script && go clean
+	cd filebase-push-script && go clean
 	@echo "Clean complete!"
 
 # Show help
@@ -63,6 +70,7 @@ help:
 	@echo "  build-sync   - Build only sync daemon"
 	@echo "  build-update - Build only update script"
 	@echo "  build-verify - Build only verify script"
+	@echo "  build-filebase - Build only filebase push script"
 	@echo "  install      - Install binaries to system PATH"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  help         - Show this help message"
@@ -72,3 +80,4 @@ help:
 	@echo "  sync-daemon/   - Syncs changes until upgrade (gitopia v5.1.0)"
 	@echo "  update-script/ - Updates blockchain after upgrade (gitopia v6.0.0-rc.6)"
 	@echo "  verify-script/ - Verifies IPFS packfiles contain all repository refs"
+	@echo "  filebase-push-script/ - Pushes packfiles to Filebase S3 storage"
